@@ -1,0 +1,20 @@
+analyze_price_task:
+  description: >
+    Use your tools to fetch price data for {ticker}. Determine the 30-day trend, calculate rough price change, and assess volume.
+  expected_output: >
+    A structured JSON object detailing trend, price change, volume signal, and a brief summary.
+
+analyze_news_task:
+  description: >
+    Use your tools to fetch recent news for {ticker}. Summarize the sentiment and identify key catalysts.
+  expected_output: >
+    A bulleted list of 3-5 key news catalysts and an overall sentiment score (Positive/Negative/Mixed).
+
+write_report_task:
+  description: >
+    Review the data provided by the Price and News agents. 
+    BEFORE writing the report, use your TXTSearchTool to search the user_preference.txt file. 
+    Tailor your final comprehensive report to match the user's risk tolerance, investment horizon, and formatting preferences.
+    DO NOT hallucinate facts; rely only on provided data.
+  expected_output: >
+    A highly structured final investment report in JSON format, customized to the user's preferences.
