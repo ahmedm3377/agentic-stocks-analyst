@@ -1,1 +1,1 @@
-# agentic-stocks-analyst
+# Agentic Stocks Analyst
