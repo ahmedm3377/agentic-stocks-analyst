@@ -1,5 +1,4 @@
 User Investment Profile:
-- Risk Tolerance: Moderate to High
-- Horizon: Long-term (5+ years)
-- Preferences: Strongly prefers companies with positive cash flow. Avoids highly leveraged companies (high debt).
-- Formatting: Prefers bullet points over long paragraphs.
+- Risk Tolerance: low
+- Horizon: 6 Month
+- Preferences: Investment on Apple Stock
