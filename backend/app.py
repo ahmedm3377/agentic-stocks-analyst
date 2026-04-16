@@ -6,13 +6,22 @@ from src.multi_agent_stock_analyst.models import (
     MarketBehaviorSummary,
     StockQuoteChanges,
     StockQuoteResponse,
+    TickerAutocompleteResponse,
+    TickerEntry,
+    TickerListResponse,
+    TickerSuggestion,
     UserPreferences,
 )
 import asyncio
+import json
 import threading
+import time
 import uvicorn
 from dotenv import load_dotenv
 import os
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 import yfinance as yf
 from newsapi import NewsApiClient
 
@@ -21,8 +30,178 @@ load_dotenv()
 
 
 PREF_FILE_PATH = "knowledge/user_preference.txt"
+POPULAR_TICKERS_PATH = os.path.join(os.path.dirname(__file__), "knowledge", "popular_tickers.json")
 
 VOLUME_UNUSUAL_RATIO = 1.5
+
+_YAHOO_SEARCH_URL = "https://query2.finance.yahoo.com/v1/finance/search"
+_ALLOWED_QUOTE_TYPES = frozenset({"EQUITY", "ETF", "MUTUALFUND"})
+_AUTOCOMPLETE_CACHE: dict[str, tuple[float, TickerAutocompleteResponse]] = {}
+_AUTOCOMPLETE_TTL_SEC = 90.0
+
+_TICKER_LIST_CACHE: dict[int, tuple[float, list[TickerEntry]]] = {}
+_TICKER_LIST_TTL_SEC = 600.0
+_YF_TICKER_SCREENER = "most_actives"
+
+
+def _fetch_tickers_yfinance(count: int) -> list[TickerEntry]:
+    """Pull liquid US symbols via yfinance predefined screener (Yahoo Finance)."""
+    cnt = max(1, min(int(count), 250))
+    result = yf.screen(_YF_TICKER_SCREENER, count=cnt)
+    quotes = result.get("quotes") or []
+    out: list[TickerEntry] = []
+    for item in quotes:
+        sym = item.get("symbol")
+        if not sym:
+            continue
+        qt = item.get("quoteType") or ""
+        if qt not in ("EQUITY", "ETF"):
+            continue
+        name = item.get("longName") or item.get("shortName") or item.get("displayName") or sym
+        out.append(TickerEntry(symbol=str(sym).strip(), name=str(name).strip()))
+    return out
+
+
+def _load_tickers_from_json(path: str, limit: int) -> list[TickerEntry]:
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    rows = [
+        TickerEntry(symbol=str(x["symbol"]).strip(), name=str(x["name"]).strip()) for x in raw
+    ]
+    return rows[: max(1, min(limit, len(rows)))]
+
+
+def _resolve_ticker_list(limit: int) -> tuple[list[TickerEntry], str]:
+    """yfinance screener first, then JSON file, then minimal defaults."""
+    lim = max(1, min(int(limit), 250))
+    now = time.monotonic()
+    cached = _TICKER_LIST_CACHE.get(lim)
+    if cached is not None:
+        cached_at, rows = cached
+        if now - cached_at < _TICKER_LIST_TTL_SEC and rows:
+            return rows, f"yfinance:{_YF_TICKER_SCREENER} (cached)"
+
+    try:
+        rows = _fetch_tickers_yfinance(lim)
+        if rows:
+            _TICKER_LIST_CACHE[lim] = (now, rows)
+            return rows, f"yfinance:{_YF_TICKER_SCREENER}"
+    except Exception:
+        pass
+
+    try:
+        rows = _load_tickers_from_json(POPULAR_TICKERS_PATH, lim)
+        if rows:
+            return rows, "curated:knowledge/popular_tickers.json"
+    except (OSError, KeyError, TypeError, json.JSONDecodeError, ValueError):
+        pass
+
+    fallback = [
+        TickerEntry(symbol="AAPL", name="Apple Inc."),
+        TickerEntry(symbol="MSFT", name="Microsoft Corporation"),
+    ]
+    return fallback[:lim], "fallback:minimal"
+
+
+def _quote_dicts_to_suggestions(quotes: list, lim: int) -> list[TickerSuggestion]:
+    """Normalize Yahoo / yfinance quote dicts into ticker rows (symbol + company name)."""
+    out: list[TickerSuggestion] = []
+    for item in quotes:
+        if len(out) >= lim:
+            break
+        if not isinstance(item, dict):
+            continue
+        sym = item.get("symbol")
+        if not sym or not isinstance(sym, str):
+            continue
+        qt = item.get("quoteType") or item.get("quotetype") or ""
+        if qt and qt not in _ALLOWED_QUOTE_TYPES:
+            continue
+        raw_name = (
+            item.get("longName")
+            or item.get("longname")
+            or item.get("shortName")
+            or item.get("shortname")
+            or item.get("displayName")
+            or sym
+        )
+        name = raw_name if isinstance(raw_name, str) else sym
+        ex = item.get("exchange")
+        exchange = ex if isinstance(ex, str) else None
+        kind = str(qt) if qt else None
+        out.append(
+            TickerSuggestion(symbol=sym.strip(), name=name.strip(), exchange=exchange, kind=kind)
+        )
+    return out
+
+
+def _yahoo_autocomplete_fetch_quotes(q: str, lim: int) -> list:
+    """Try yfinance Search (phrase + fuzzy; best for company names), then Yahoo HTTP fallback."""
+    try:
+        search = yf.Search(
+            q,
+            max_results=lim,
+            news_count=0,
+            lists_count=0,
+            enable_fuzzy_query=True,
+            timeout=15,
+        )
+        if search.quotes:
+            return search.quotes
+    except Exception:
+        pass
+
+    params = {
+        "q": q,
+        "quotesCount": lim,
+        "newsCount": 0,
+        "listsCount": 0,
+        "quotesQueryId": "tss_match_phrase_query",
+        "enableFuzzyQuery": "true",
+    }
+    url = f"{_YAHOO_SEARCH_URL}?{urlencode(params)}"
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+        },
+    )
+    with urlopen(req, timeout=12) as resp:
+        payload = json.loads(resp.read().decode())
+    return payload.get("quotes") or []
+
+
+def _yahoo_autocomplete(query: str, limit: int) -> TickerAutocompleteResponse:
+    """Match tickers by symbol or company name (Yahoo search)."""
+    q = query.strip()
+    if not q:
+        return TickerAutocompleteResponse(suggestions=[])
+
+    lim = max(1, min(int(limit), 25))
+    cache_key = f"{q.lower()}:{lim}"
+    now = time.monotonic()
+    cached = _AUTOCOMPLETE_CACHE.get(cache_key)
+    if cached is not None:
+        cached_at, val = cached
+        if now - cached_at < _AUTOCOMPLETE_TTL_SEC:
+            return val
+
+    try:
+        quotes = _yahoo_autocomplete_fetch_quotes(q, lim)
+    except HTTPError as e:
+        if e.code == 429:
+            empty = TickerAutocompleteResponse(suggestions=[])
+            _AUTOCOMPLETE_CACHE[cache_key] = (now, empty)
+            return empty
+        raise HTTPException(status_code=502, detail=f"Autocomplete unavailable: {e}") from e
+    except (URLError, TimeoutError, json.JSONDecodeError, ValueError) as e:
+        raise HTTPException(status_code=502, detail=f"Autocomplete unavailable: {e}") from e
+
+    out = _quote_dicts_to_suggestions(quotes, lim)
+    result = TickerAutocompleteResponse(suggestions=out)
+    _AUTOCOMPLETE_CACHE[cache_key] = (now, result)
+    return result
 
 
 def _stock_quote_from_history(ticker: str, hist) -> StockQuoteResponse:
@@ -242,6 +421,45 @@ async def update_preferences(prefs: UserPreferences):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
+
+@app.get("/api/tickers", response_model=TickerListResponse)
+async def list_popular_tickers(limit: int = 50):
+    """Ticker list from yfinance Yahoo screener (``most_actives``), with JSON/minimal fallback."""
+    if limit < 1:
+        limit = 1
+    if limit > 250:
+        limit = 250
+    try:
+        tickers, source = await asyncio.to_thread(_resolve_ticker_list, limit)
+        return TickerListResponse(tickers=tickers, count=len(tickers), source=source)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _autocomplete_handler(q: str, limit: int) -> TickerAutocompleteResponse:
+    if limit < 1:
+        limit = 1
+    if limit > 25:
+        limit = 25
+    try:
+        return await asyncio.to_thread(_yahoo_autocomplete, q, limit)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/stock/autocomplete", response_model=TickerAutocompleteResponse)
+async def autocomplete_tickers(q: str = "", limit: int = 12):
+    """Suggest tickers by **company name** or symbol (phrase + fuzzy match via Yahoo)."""
+    return await _autocomplete_handler(q, limit)
+
+
+@app.get("/api/stock/search", response_model=TickerAutocompleteResponse)
+async def search_stocks(q: str = "", limit: int = 12):
+    """Alias of ``/api/stock/autocomplete``: find symbols by name or ticker."""
+    return await _autocomplete_handler(q, limit)
+
 
 @app.get("/api/stock/{ticker}/quote", response_model=StockQuoteResponse)
 async def get_fast_quote(ticker: str):

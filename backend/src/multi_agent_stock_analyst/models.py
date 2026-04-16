@@ -56,3 +56,29 @@ class StockQuoteResponse(BaseModel):
     )
     indicators: BasicIndicators
     summary: MarketBehaviorSummary
+
+
+class TickerEntry(BaseModel):
+    symbol: str
+    name: str
+
+
+class TickerListResponse(BaseModel):
+    """Curated symbols for dropdowns and offline-friendly lists."""
+
+    tickers: list[TickerEntry]
+    count: int
+    source: str = "curated"
+
+
+class TickerSuggestion(BaseModel):
+    symbol: str
+    name: str
+    exchange: str | None = None
+    kind: str | None = Field(default=None, description="e.g. EQUITY, ETF")
+
+
+class TickerAutocompleteResponse(BaseModel):
+    """Query-based matches (Yahoo Finance search)."""
+
+    suggestions: list[TickerSuggestion]
