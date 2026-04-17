@@ -204,6 +204,42 @@ def _yahoo_autocomplete(query: str, limit: int) -> TickerAutocompleteResponse:
     return result
 
 
+def _normalize_live_update(message: dict, subscribed_symbol: str) -> dict | None:
+    """Map a yfinance stream tick into a frontend-friendly payload."""
+    symbol = str(message.get("id") or "").upper()
+    if symbol != subscribed_symbol:
+        return None
+
+    price = message.get("price")
+    if price is None:
+        return None
+
+    return {
+        "type": "quote_update",
+        "ticker": symbol,
+        "price": float(price),
+        "change_pct": message.get("changePercent"),
+        "day_volume": message.get("dayVolume"),
+        "market_state": message.get("marketHours"),
+        "ts": message.get("time"),
+    }
+
+
+def _enqueue_live_update(queue: asyncio.Queue[dict], update: dict):
+    """Keep only the freshest stream updates if queue gets full."""
+    try:
+        queue.put_nowait(update)
+    except asyncio.QueueFull:
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        try:
+            queue.put_nowait(update)
+        except asyncio.QueueFull:
+            pass
+
+
 def _stock_quote_from_history(ticker: str, hist) -> StockQuoteResponse:
     """Derive price, multi-horizon returns, volume context, and a compact behavior summary from daily bars."""
     h = hist.dropna(how="any")
@@ -388,6 +424,51 @@ async def websocket_endpoint(websocket: WebSocket):
         print("Client disconnected.")
 
 
+@app.websocket("/api/stock/live/{ticker}")
+async def stream_live_quote(websocket: WebSocket, ticker: str):
+    """Proxy yfinance websocket ticks for one ticker to the frontend."""
+    symbol = ticker.strip().upper()
+    if not symbol:
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+
+    stream = yf.AsyncWebSocket(verbose=False)
+    queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=100)
+
+    async def on_tick(message: dict):
+        update = _normalize_live_update(message, symbol)
+        if update is not None:
+            _enqueue_live_update(queue, update)
+
+    listen_task = asyncio.create_task(stream.listen(on_tick))
+
+    try:
+        await stream.subscribe(symbol)
+        await websocket.send_json({"type": "subscribed", "ticker": symbol})
+
+        while True:
+            payload = await queue.get()
+            await websocket.send_json(payload)
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        try:
+            await websocket.send_json({"type": "error", "detail": str(e)})
+        except Exception:
+            pass
+    finally:
+        listen_task.cancel()
+        try:
+            await stream.unsubscribe(symbol)
+        except Exception:
+            pass
+        try:
+            await stream.close()
+        except Exception:
+            pass
 
 
 @app.get("/api/preferences")

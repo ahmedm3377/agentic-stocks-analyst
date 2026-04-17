@@ -89,6 +89,20 @@ function filterPopular(popular: TickerEntry[], q: string): DisplayRow[] {
     .map((p) => ({ symbol: p.symbol, name: p.name, meta: 'Popular list' }))
 }
 
+function getLiveQuoteWsUrl(ticker: string): string {
+  const symbol = encodeURIComponent(ticker.trim().toUpperCase())
+  const explicitBase = import.meta.env.VITE_API_BASE as string | undefined
+
+  if (explicitBase && explicitBase.length > 0) {
+    const base = new URL(explicitBase)
+    const wsProtocol = base.protocol === 'https:' ? 'wss:' : 'ws:'
+    return `${wsProtocol}//${base.host}/api/stock/live/${symbol}`
+  }
+
+  const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${wsProtocol}//${window.location.host}/api/stock/live/${symbol}`
+}
+
 function App() {
   const listId = useId()
   const inputRef = useRef<HTMLInputElement>(null)
@@ -98,6 +112,10 @@ function App() {
   const [data, setData] = useState<StockQuoteResponse | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [liveConnected, setLiveConnected] = useState(false)
+  const [liveConnecting, setLiveConnecting] = useState(false)
+  const [liveError, setLiveError] = useState<string | null>(null)
+  const [lastLiveTs, setLastLiveTs] = useState<number | null>(null)
 
   const [popular, setPopular] = useState<TickerEntry[]>([])
   const [remoteRows, setRemoteRows] = useState<DisplayRow[]>([])
@@ -193,6 +211,83 @@ function App() {
     },
     [fetchQuote],
   )
+
+  useEffect(() => {
+    if (!data?.ticker) {
+      setLiveConnected(false)
+      setLiveConnecting(false)
+      setLiveError(null)
+      return
+    }
+
+    const ws = new WebSocket(getLiveQuoteWsUrl(data.ticker))
+    setLiveConnecting(true)
+    setLiveConnected(false)
+    setLiveError(null)
+
+    ws.onopen = () => {
+      setLiveConnecting(false)
+      setLiveConnected(true)
+      setLiveError(null)
+    }
+
+    ws.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(event.data) as {
+          type?: string
+          ticker?: string
+          price?: number
+          change_pct?: number
+          ts?: number
+          detail?: string
+        }
+
+        if (payload.type === 'error') {
+          setLiveError(payload.detail ?? 'Live stream error')
+          return
+        }
+
+        if (payload.type !== 'quote_update') return
+
+        setData((prev) => {
+          if (!prev || !payload.ticker || prev.ticker !== payload.ticker) {
+            return prev
+          }
+
+          const nextPrice = typeof payload.price === 'number' ? payload.price : prev.price
+          const nextDayChange =
+            typeof payload.change_pct === 'number' ? payload.change_pct : prev.changes_pct.day
+
+          return {
+            ...prev,
+            price: nextPrice,
+            changes_pct: { ...prev.changes_pct, day: nextDayChange },
+          }
+        })
+
+        if (typeof payload.ts === 'number') {
+          setLastLiveTs(payload.ts)
+        }
+      } catch {
+        // Ignore malformed live packets
+      }
+    }
+
+    ws.onerror = () => {
+      setLiveConnecting(false)
+      setLiveConnected(false)
+      setLiveError('Live connection failed')
+    }
+
+    ws.onclose = () => {
+      setLiveConnecting(false)
+      setLiveConnected(false)
+    }
+
+    return () => {
+      ws.close()
+    }
+  }, [data?.ticker])
 
   const showMenu = menuOpen && (displayRows.length > 0 || searchInFlight)
 
@@ -358,8 +453,20 @@ function App() {
               <div className="border-b border-zinc-100 bg-linear-to-br from-violet-500/10 via-transparent to-transparent px-6 py-6 dark:border-zinc-800 dark:from-violet-500/5">
                 <div className="flex flex-wrap items-end justify-between gap-4">
                   <div>
-                    <p className="text-xs font-semibold uppercase tracking-widest text-zinc-500 dark:text-zinc-400">
-                      {data.ticker}
+                    <p className="flex items-center gap-2 text-xs font-semibold uppercase tracking-widest text-zinc-500 dark:text-zinc-400">
+                      <span>{data.ticker}</span>
+                      {liveConnecting && (
+                        <span className="inline-flex items-center gap-1 rounded-full bg-zinc-100 px-2 py-0.5 text-[10px] text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
+                          <SearchSpinner className="size-2.5" />
+                          Connecting
+                        </span>
+                      )}
+                      {liveConnected && (
+                        <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] text-emerald-700 dark:text-emerald-300">
+                          <span className="size-1.5 rounded-full bg-emerald-500" />
+                          Live
+                        </span>
+                      )}
                     </p>
                     <p className="mt-1 flex items-baseline gap-2">
                       <span className="text-4xl font-semibold tracking-tight tabular-nums sm:text-5xl">
@@ -371,6 +478,13 @@ function App() {
                       <span className="text-sm font-medium text-zinc-500 dark:text-zinc-400">
                         {data.currency}
                       </span>
+                    </p>
+                    <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+                      {liveError
+                        ? liveError
+                        : liveConnected
+                          ? `Streaming live${lastLiveTs ? ` · ${new Date(lastLiveTs * 1000).toLocaleTimeString()}` : ''}`
+                          : 'Live stream idle'}
                     </p>
                   </div>
                   <div className="flex flex-wrap gap-2">
