@@ -10,10 +10,57 @@ analyze_news_task:
   expected_output: >
     A bulleted list of 3-5 key news catalysts and an overall sentiment score (Positive/Negative/Mixed).
 
-write_report_task:
+consult_knowledge_task:
   description: >
-    Delegate this task ONLY AFTER the price and news data have been gathered. 
-    The assigned agent must use their TXTSearchTool to search the user_preference.txt file, and then tailor a final comprehensive report to match the user's risk tolerance and formatting preferences.
-    Ensure they DO NOT hallucinate facts; rely only on provided data.
+    Review the user's specific query: "{user_query}". 
+    If the query asks a specific question, answer it. 
+    You MUST also use your TXTSearchTool to read the user_preference.txt file to determine the user's risk tolerance, investment horizon, and formatting preferences.
+    
+    CRITICAL RULE: The target asset for this entire operation is {ticker}. If the user_preference.txt file mentions other favorite stocks (like AAPL), IGNORE THEM for this report. You are strictly extracting their risk profile and writing style.
   expected_output: >
-    A highly structured final investment report in JSON format, customized to the user's preferences.
+    A clear summary of the user's risk and formatting preferences, plus the answer to their specific query (if one was asked).
+
+draft_report_task:
+  description: >
+    Review the data gathered by the analysts and the Knowledge Advisor for {ticker}.
+    Draft an initial report tailored to the user's profile. You MUST format your plain-text draft using exactly these headers:
+    - MARKET VIEW:
+    - TREND:
+    - KEY CATALYSTS:
+    - BULL CASE:
+    - BEAR CASE:
+    - MAIN RISKS:
+    - CONFIDENCE LEVEL:
+  expected_output: >
+    An initial plain-text investment report strictly organized by the requested headers.
+
+review_report_task:
+  description: >
+    You have received the initial plain-text draft from the previous task.
+    
+    Step 1: You MUST call the tool named "Ask Human for Review" and pass the ENTIRE draft into it.
+    Step 2: Wait for the tool to return the user's feedback.
+    Step 3: CRITICAL REWRITE: You must completely rewrite the draft to perfectly match the user's instructions.
+  expected_output: >
+    A fully revised, human-approved investment report in plain text that strictly obeys the user's feedback.
+
+format_json_task:
+  description: >
+    Take the final revised plain-text draft from the review task. Convert it into the FinalReport JSON schema.
+    DO NOT pull in outside data. DO NOT add missing data. 
+    CRITICAL: You must perfectly mirror the constraints of the revised draft.
+  expected_output: >
+    The final investment report strictly formatted as a JSON object, perfectly mirroring the exact length and content of the revised text.
+
+
+format_json_task:
+  description: >
+    You are a blind data formatter. Take the plain-text draft provided in the context and map it directly into the FinalReport JSON schema.
+    
+    CRITICAL RULES:
+    1. DO NOT add any extra information, sentences, or bullet points.
+    2. If the context has exactly 3 bullet points for catalysts, your JSON list MUST have exactly 3 items.
+    3. If the context has 1 short sentence for the bull case, your JSON bull case MUST be exactly 1 sentence.
+    4. You are strictly forbidden from elaborating or expanding the text.
+  expected_output: >
+    A JSON object perfectly matching the exact lengths, constraints, and content of the provided context.

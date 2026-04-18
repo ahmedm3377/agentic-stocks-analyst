@@ -52,7 +52,6 @@ async def health_check():
         "version": "1.0.0"
     }
 
-
 @app.websocket("/api/analyze")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -61,7 +60,7 @@ async def websocket_endpoint(websocket: WebSocket):
     wait_event = threading.Event()
     shared_state = {}
 
-    # Capture the main thread's event loop 
+    # Capture the main thread's event loop HERE
     main_loop = asyncio.get_running_loop()
 
     # Helper function to let the synchronous Crew thread send async WebSocket messages
@@ -74,10 +73,13 @@ async def websocket_endpoint(websocket: WebSocket):
             print(f"Failed to send WebSocket message (client likely disconnected): {e}")
 
     # Function to run the Crew (this will run in a separate thread)
-  # Function to run the Crew (this will run in a separate thread)
-    def run_crew(ticker: str):
+    def run_crew(ticker: str, user_query: str = ""):
         try:
-            send_message_sync({"type": "status", "data": f"Starting analysis for {ticker}..."})
+            # Update status message based on whether it's a standard analysis or a custom query
+            if user_query:
+                send_message_sync({"type": "status", "data": f"Processing query for {ticker}: {user_query}..."})
+            else:
+                send_message_sync({"type": "status", "data": f"Starting full analysis for {ticker}..."})
             
             # 1. Instantiate the crew completely empty to avoid decorator bugs
             stock_crew = MultiAgentStockAnalyst()
@@ -89,26 +91,19 @@ async def websocket_endpoint(websocket: WebSocket):
                 shared_state=shared_state
             )
             
-            result = stock_crew.crew().kickoff(inputs={'ticker': ticker})
+            # 3. Pass BOTH the ticker and the custom user query into the Crew inputs
+            inputs = {
+                'ticker': ticker,
+                'user_query': user_query
+            }
+            
+            # Kickoff the hierarchical manager
+            result = stock_crew.crew().kickoff(inputs=inputs)
+            
+            # Extract the data and send it back
             final_data = result.pydantic.model_dump() if result.pydantic else result.raw
-            
             send_message_sync({"type": "complete", "data": final_data})
-        except Exception as e:
-            send_message_sync({"type": "error", "data": str(e)})
-        try:
-            send_message_sync({"type": "status", "data": f"Starting analysis for {ticker}..."})
             
-            # Instantiate the crew with our threading bridges
-            stock_crew = MultiAgentStockAnalyst(
-                send_message_sync=send_message_sync,
-                wait_event=wait_event,
-                shared_state=shared_state
-            )
-            
-            result = stock_crew.crew().kickoff(inputs={'ticker': ticker})
-            final_data = result.pydantic.model_dump() if result.pydantic else result.raw
-            
-            send_message_sync({"type": "complete", "data": final_data})
         except Exception as e:
             send_message_sync({"type": "error", "data": str(e)})
 
@@ -116,20 +111,45 @@ async def websocket_endpoint(websocket: WebSocket):
         # Listen for messages from the frontend
         while True:
             data = await websocket.receive_json()
+            action = data.get("action")
             
-            if data.get("action") == "start":
-                # User clicked "Analyze". Run the crew in a background thread.
+            if action == "start":
+                # User requested an analysis or asked a question
                 ticker = data.get("ticker", "AAPL")
-                threading.Thread(target=run_crew, args=(ticker,)).start()
+                user_query = data.get("query", "") # Extract custom query if provided
                 
-            elif data.get("action") == "feedback":
+                # Run the crew in a background thread
+                threading.Thread(target=run_crew, args=(ticker, user_query)).start()
+                
+            elif action == "feedback":
                 # User submitted their review. Save it and wake up the Crew thread!
                 shared_state['feedback'] = data.get("message")
                 wait_event.set() 
+            
+            elif action == "chat":
+                # User is asking a question about the finished report
+                question = data.get("question")
+                report_context = data.get("context") 
+                
+                def run_chat():
+                    try:
+                        send_message_sync({"type": "status", "data": "Consulting advisor..."})
+                        stock_crew = MultiAgentStockAnalyst()
+                        
+                        # Call our new mini-crew method
+                        answer = stock_crew.answer_follow_up(question, report_context)
+                        
+                        # Send the answer back to the UI
+                        send_message_sync({"type": "chat_response", "data": answer})
+                    except Exception as e:
+                        send_message_sync({"type": "error", "data": str(e)})
+
+                # Run the chat in a background thread so the socket doesn't block
+                threading.Thread(target=run_chat).start()
 
     except WebSocketDisconnect:
         print("Client disconnected.")
-
+        
 
 @app.websocket("/api/stock/live/{ticker}")
 async def stream_live_quote(websocket: WebSocket, ticker: str):

@@ -1,54 +1,109 @@
-# MultiAgentStockAnalyst Crew
+# WebSocket API Integration Guide: Agentic Stock Analyst
 
-Welcome to the MultiAgentStockAnalyst Crew project, powered by [crewAI](https://crewai.com). This template is designed to help you set up a multi-agent AI system with ease, leveraging the powerful and flexible framework provided by crewAI. Our goal is to enable your agents to collaborate effectively on complex tasks, maximizing their collective intelligence and capabilities.
+This guide explains how to connect to, use, and test the CrewAI multi-agent WebSocket endpoint using Postman.
 
-## Installation
+## 🔗 Endpoint Details
+- **Protocol**: WebSocket (`ws://`)
+- **URL**: `ws://127.0.0.1:8000/api/analyze` *(assuming default local Uvicorn port)*
 
-Ensure you have Python >=3.10 <3.14 installed on your system. This project uses [UV](https://docs.astral.sh/uv/) for dependency management and package handling, offering a seamless setup and execution experience.
+---
 
-First, if you haven't already, install uv:
+## 🛠️ Step 1: Set Up Postman for WebSockets
+1. Open Postman.
+2. Click **New** > **WebSocket**.
+3. In the URL bar, enter: `ws://127.0.0.1:8000/api/analyze`
+4. Click **Connect**. (You should see a "Connected" message in the lower console).
+5. Ensure the message format is set to **JSON**.
 
-```bash
-pip install uv
+---
+
+## 🚀 Step 2: The Core Analysis Flow (Human-in-the-Loop)
+
+The primary workflow requires a back-and-forth interaction. The backend will pause and wait for user feedback before generating the final JSON report.
+
+### 1. Trigger the Analysis
+Send the `start` action to wake up the agents and begin the research phase.
+
+**Send Message:**
+```json
+{
+    "action": "start",
+    "ticker": "TSLA",
+    "query": "What are the latest news catalysts for this stock?"
+}
+
 ```
 
-Next, navigate to your project directory and install the dependencies:
+###  2. Wait for the Draft
+The server will stream status messages while the agents work. Eventually, it will send a review_needed payload containing the plain-text draft.
 
-(Optional) Lock the dependencies and install them by using the CLI command:
-```bash
-crewai install
+Expected Server Response:
+
+```JSON
+{
+    "type": "review_needed",
+    "data": "MARKET VIEW:\nTSLA appears suitable only for a cautious... [rest of draft]"
+}
 ```
-### Customizing
+### 3. Send Human Feedback
+The backend is now paused. Read the draft and send your feedback using the feedback action. The agents will rewrite the draft based exactly on these instructions.
 
-**Add your `OPENAI_API_KEY` into the `.env` file**
+Send Message:
 
-- Modify `src/multi_agent_stock_analyst/config/agents.yaml` to define your agents
-- Modify `src/multi_agent_stock_analyst/config/tasks.yaml` to define your tasks
-- Modify `src/multi_agent_stock_analyst/crew.py` to add your own logic, tools and specific args
-- Modify `src/multi_agent_stock_analyst/main.py` to add custom inputs for your agents and tasks
+```JSON
+{
+    "action": "feedback",
+    "message": "Rewrite the entire report to be extremely concise. Limit the key_catalysts to only 3 bullet points, and make the bull_case just one short sentence."
+}
 
-## Running the Project
-
-To kickstart your crew of AI agents and begin task execution, run this from the root folder of your project:
-
-```bash
-$ crewai run
 ```
+### 4. Receive Final JSON Report
+The formatting agent will convert the approved draft into strict JSON. The connection will remain open for follow-up questions.
 
-This command initializes the Multi-agent stock analyst Crew, assembling the agents and assigning them tasks as defined in your configuration.
+Expected Server Response:
 
-This example, unmodified, will run the create a `report.md` file with the output of a research on LLMs in the root folder.
+```JSON
+{
+    "type": "complete",
+    "data": {
+        "ticker": "TSLA",
+        "market_view": "...",
+        "trend": "...",
+        "key_catalysts": ["...", "...", "..."],
+        "bull_case": "...",
+        "bear_case": "...",
+        "main_risks": ["..."],
+        "confidence_level": "..."
+    }
 
-## Understanding Your Crew
 
-The Multi-agent stock analyst Crew is composed of multiple AI agents, each with unique roles, goals, and tools. These agents collaborate on a series of tasks, defined in `config/tasks.yaml`, leveraging their collective skills to achieve complex objectives. The `config/agents.yaml` file outlines the capabilities and configurations of each agent in your crew.
+```
+### Step 3: The Follow-Up Chat Flow
+Once the report is complete, you can ask the Knowledge Advisor questions about the report without running the entire analysis pipeline again.
 
-## Support
+1. Ask a Question
+Send the chat action, passing in the user's question and the data object you received from the complete payload.
 
-For support, questions, or feedback regarding the MultiAgentStockAnalyst Crew or crewAI.
-- Visit our [documentation](https://docs.crewai.com)
-- Reach out to us through our [GitHub repository](https://github.com/joaomdmoura/crewai)
-- [Join our Discord](https://discord.com/invite/X4JWnZnxPb)
-- [Chat with our docs](https://chatg.pt/DWjSBZn)
+Send Message:
 
-Let's create wonders together with the power and simplicity of crewAI.
+```JSON
+{
+    "action": "chat",
+    "question": "What exactly do they mean by 'Optimus skepticism' in the bear case?",
+    "context": {
+        "ticker": "TSLA",
+        "market_view": "...",
+        "bear_case": "...",
+        "main_risks": ["..."]
+    }
+}
+2. Receive the Answer
+The advisor will return a conversational string.
+
+Expected Server Response:
+
+```JSON
+{
+    "type": "chat_response",
+    "data": "Optimus skepticism refers to doubts among investors regarding Tesla's ability to successfully commercialize its humanoid robot..."
+}
