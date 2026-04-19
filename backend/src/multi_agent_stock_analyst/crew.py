@@ -62,7 +62,7 @@ class MultiAgentStockAnalyst():
             config=self.agents_config['crew_manager'],
             allow_delegation=True,
             llm=LLM(model=MODEL, temperature=0), 
-            verbose=True
+            verbose=True,
         )
 
     @agent
@@ -165,8 +165,11 @@ class MultiAgentStockAnalyst():
                 self.review_report_task(),    
                 self.format_json_task()       
             ],
+
+            process=Process.hierarchical,
+            manager_agent=self.crew_manager(),
+
             tracing=True,
             verbose=True,
-            process=Process.hierarchical,
-            manager_agent=self.crew_manager() 
+            memory=True 
         )
