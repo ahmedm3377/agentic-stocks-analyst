@@ -44,7 +44,7 @@ class HumanFeedbackTool(BaseTool):
         # 3. Get the user's feedback
         user_feedback = self.shared_state.get('feedback', 'Looks good, proceed.')
         
-        # ---> THE MAGIC INJECTION <---
+        
         # We wrap the feedback in a strict command so the LLM cannot ignore it.
         return (
             f"USER FEEDBACK: {user_feedback}\n\n"

@@ -149,7 +149,6 @@ class MultiAgentStockAnalyst():
     @crew
     def crew(self) -> Crew:
         return Crew(
-            # ---> ADD THE NEW AGENT TO THE ROSTER <---
             agents=[
                 self.knowledge_advisor(), 
                 self.price_analyst(), 
