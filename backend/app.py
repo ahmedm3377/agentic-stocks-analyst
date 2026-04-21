@@ -152,6 +152,41 @@ async def websocket_endpoint(websocket: WebSocket):
         print("Client disconnected.")
         
 
+
+@app.get("/api/preferences")
+async def get_preferences():
+    """Fetches the current user preferences to populate the frontend form."""
+    if not os.path.exists(PREF_FILE_PATH):
+        return {"content": "No preferences set."}
+    
+    with open(PREF_FILE_PATH, "r") as file:
+        content = file.read()
+    return {"content": content}
+
+@app.post("/api/preferences")
+async def update_preferences(prefs: UserPreferences):
+    """Overwrites the RAG knowledge document with new frontend settings."""
+    try:
+        formatted_content = (
+            f"User Investment Profile:\n"
+            f"- Risk Tolerance: {prefs.risk_tolerance}\n"
+            f"- Horizon: {prefs.investment_horizon}\n"
+            f"- Preferences: {prefs.preferences}\n"
+        )
+        
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(PREF_FILE_PATH), exist_ok=True)
+        
+        with open(PREF_FILE_PATH, "w") as file:
+            file.write(formatted_content)
+            
+        return {"status": "success", "message": "Preferences updated for RAG."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+
+
 @app.websocket("/api/stock/live/{ticker}")
 async def stream_live_quote(websocket: WebSocket, ticker: str):
     """Proxy yfinance websocket ticks for one ticker to the frontend."""
@@ -199,37 +234,6 @@ async def stream_live_quote(websocket: WebSocket, ticker: str):
             pass
 
 
-@app.get("/api/preferences")
-async def get_preferences():
-    """Fetches the current user preferences to populate the frontend form."""
-    if not os.path.exists(PREF_FILE_PATH):
-        return {"content": "No preferences set."}
-    
-    with open(PREF_FILE_PATH, "r") as file:
-        content = file.read()
-    return {"content": content}
-
-@app.post("/api/preferences")
-async def update_preferences(prefs: UserPreferences):
-    """Overwrites the RAG knowledge document with new frontend settings."""
-    try:
-        formatted_content = (
-            f"User Investment Profile:\n"
-            f"- Risk Tolerance: {prefs.risk_tolerance}\n"
-            f"- Horizon: {prefs.investment_horizon}\n"
-            f"- Preferences: {prefs.preferences}\n"
-        )
-        
-        # Ensure directory exists
-        os.makedirs(os.path.dirname(PREF_FILE_PATH), exist_ok=True)
-        
-        with open(PREF_FILE_PATH, "w") as file:
-            file.write(formatted_content)
-            
-        return {"status": "success", "message": "Preferences updated for RAG."}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
 
 @app.get("/api/tickers", response_model=TickerListResponse)
 async def list_popular_tickers(limit: int = 50):

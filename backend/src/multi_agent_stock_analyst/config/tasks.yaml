@@ -44,14 +44,6 @@ review_report_task:
   expected_output: >
     A fully revised, human-approved investment report in plain text that strictly obeys the user's feedback.
 
-format_json_task:
-  description: >
-    Take the final revised plain-text draft from the review task. Convert it into the FinalReport JSON schema.
-    DO NOT pull in outside data. DO NOT add missing data. 
-    CRITICAL: You must perfectly mirror the constraints of the revised draft.
-  expected_output: >
-    The final investment report strictly formatted as a JSON object, perfectly mirroring the exact length and content of the revised text.
-
 
 format_json_task:
   description: >
