@@ -1,21 +1,45 @@
 # backend/src/multi_agent_stock_analyst/crew.py
 
+import json
+import os
+
 from crewai import Agent, Crew, Process, Task, LLM
 from crewai.project import CrewBase, agent, crew, task
-from crewai_tools import TXTSearchTool 
+from crewai.tasks.task_output import TaskOutput
+from crewai_tools import TXTSearchTool
+from dotenv import load_dotenv
+
 from .tools.custom_tool import crew_price_tool, crew_news_tool
 from .tools.human_tool import HumanFeedbackTool
 from .models import PriceAnalysis, FinalReport
-from dotenv import load_dotenv
-import os
 
 load_dotenv()
 MODEL = os.getenv('MODEL', 'gpt-5.4')
+# Memory/RAG must use an embeddings API model, not the chat MODEL (403 if misrouted).
+OPENAI_EMBEDDING_MODEL = os.getenv('OPENAI_EMBEDDING_MODEL', 'text-embedding-3-small')
 
 PREF_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "knowledge", "user_preference.txt")
 
 # Initialize the RAG tool
 user_pref_rag_tool = TXTSearchTool(txt=PREF_FILE_PATH) if os.path.exists(PREF_FILE_PATH) else None
+
+# Cap payload size for WebSocket JSON (full trace still in terminal if verbose=True)
+_MAX_TASK_OUTPUT_WS_CHARS = int(os.getenv('CREW_TASK_OUTPUT_WS_MAX_CHARS', '16000'))
+
+
+def _text_from_task_output(output: TaskOutput) -> str:
+    if output.raw:
+        return output.raw
+    if output.summary:
+        return output.summary
+    if output.pydantic is not None:
+        if hasattr(output.pydantic, 'model_dump_json'):
+            return output.pydantic.model_dump_json(indent=2)
+        return str(output.pydantic)
+    if output.json_dict:
+        return json.dumps(output.json_dict, indent=2, default=str)
+    return ''
+
 
 @CrewBase
 class MultiAgentStockAnalyst():
@@ -55,6 +79,28 @@ class MultiAgentStockAnalyst():
             wait_event=wait_event,
             shared_state=shared_state
         )
+        self._send_ws = send_message_sync
+
+    def _emit_task_output_ws(self, output: TaskOutput) -> None:
+        send = getattr(self, '_send_ws', None)
+        if send is None:
+            return
+        text = _text_from_task_output(output)
+        truncated = False
+        if len(text) > _MAX_TASK_OUTPUT_WS_CHARS:
+            text = text[:_MAX_TASK_OUTPUT_WS_CHARS] + '\n… [truncated for WebSocket; see server logs for full output]'
+            truncated = True
+        task_name = output.name or 'task'
+        agent_role = output.agent or 'agent'
+        send({
+            'type': 'task_output',
+            'data': {
+                'task_name': task_name,
+                'agent_role': agent_role,
+                'output': text,
+                'truncated': truncated,
+            },
+        })
 
     @agent
     def crew_manager(self) -> Agent:
@@ -148,21 +194,26 @@ class MultiAgentStockAnalyst():
 
     @crew
     def crew(self) -> Crew:
+        crew_self = self
+
+        def on_task_completed(output: TaskOutput) -> None:
+            crew_self._emit_task_output_ws(output)
+
         return Crew(
             agents=[
-                self.knowledge_advisor(), 
-                self.price_analyst(), 
-                self.news_analyst(), 
-                self.report_writer(), 
-                self.json_compiler() 
-            ], 
+                self.knowledge_advisor(),
+                self.price_analyst(),
+                self.news_analyst(),
+                self.report_writer(),
+                self.json_compiler()
+            ],
             tasks=[
                 self.consult_knowledge_task(),
                 self.analyze_price_task(),
                 self.analyze_news_task(),
-                self.draft_report_task(),     
-                self.review_report_task(),    
-                self.format_json_task()       
+                self.draft_report_task(),
+                self.review_report_task(),
+                self.format_json_task()
             ],
 
             process=Process.hierarchical,
@@ -170,5 +221,10 @@ class MultiAgentStockAnalyst():
 
             tracing=True,
             verbose=True,
-            memory=True 
+            memory=True,
+            task_callback=on_task_completed,
+            embedder={
+                'provider': 'openai',
+                'config': {'model_name': OPENAI_EMBEDDING_MODEL},
+            },
         )

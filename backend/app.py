@@ -29,7 +29,8 @@ from src.multi_agent_stock_analyst.utils import (
 
 load_dotenv()
 
-
+# WebSocket route for crew runs — client must connect here (see frontend `ANALYZE_WEBSOCKET_PATH`).
+ANALYZE_WEBSOCKET_PATH = "/api/analyze"
 
 PREF_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge", "user_preference.txt")
 
@@ -52,7 +53,7 @@ async def health_check():
         "version": "1.0.0"
     }
 
-@app.websocket("/api/analyze")
+@app.websocket(ANALYZE_WEBSOCKET_PATH)
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     
