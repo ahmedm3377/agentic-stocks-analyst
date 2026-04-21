@@ -41,6 +41,33 @@ type ActivityEntry = {
 }
 
 type CrewDeliverable = TaskOutputPayload & { id: string; ts: number }
+type AgentActivityItem =
+  | { id: string; ts: number; kind: 'status'; message: string }
+  | {
+      id: string
+      ts: number
+      kind: 'task_output'
+      task_name: string
+      agent_role: string
+      output: string
+      truncated?: boolean
+    }
+type PriceTaskResult = {
+  trend: string
+  price_change_30d: number
+  volume_signal: string
+  summary: string
+}
+type JsonTaskResult = {
+  ticker: string
+  market_view: string
+  trend: string
+  key_catalysts: string[]
+  bull_case: string
+  bear_case: string
+  main_risks: string[]
+  confidence_level: string
+}
 
 function formatDuration(totalSec: number): string {
   const m = Math.floor(totalSec / 60)
@@ -77,6 +104,74 @@ function analysisPhaseLabel(phase: SessionPhase): string {
   }
 }
 
+function parsePriceTaskResult(raw: string): PriceTaskResult | null {
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    if (
+      typeof parsed.trend === 'string' &&
+      typeof parsed.price_change_30d === 'number' &&
+      typeof parsed.volume_signal === 'string' &&
+      typeof parsed.summary === 'string'
+    ) {
+      return {
+        trend: parsed.trend,
+        price_change_30d: parsed.price_change_30d,
+        volume_signal: parsed.volume_signal,
+        summary: parsed.summary,
+      }
+    }
+  } catch {
+    // Not JSON; caller will render fallback text block.
+  }
+  return null
+}
+
+function trendBadgeStyles(trend: string): string {
+  const t = trend.toLowerCase()
+  if (t === 'bullish') return 'bg-emerald-500/15 text-emerald-800 dark:text-emerald-300'
+  if (t === 'bearish') return 'bg-rose-500/15 text-rose-800 dark:text-rose-300'
+  return 'bg-amber-500/15 text-amber-900 dark:text-amber-200'
+}
+
+function volumeBadgeStyles(volumeSignal: string): string {
+  const v = volumeSignal.toLowerCase()
+  if (v === 'high') return 'bg-violet-500/15 text-violet-900 dark:text-violet-200'
+  if (v === 'low') return 'bg-sky-500/15 text-sky-900 dark:text-sky-200'
+  return 'bg-zinc-500/15 text-zinc-800 dark:text-zinc-300'
+}
+
+function parseJsonTaskResult(raw: string): JsonTaskResult | null {
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    if (
+      typeof parsed.ticker === 'string' &&
+      typeof parsed.market_view === 'string' &&
+      typeof parsed.trend === 'string' &&
+      Array.isArray(parsed.key_catalysts) &&
+      parsed.key_catalysts.every((x) => typeof x === 'string') &&
+      typeof parsed.bull_case === 'string' &&
+      typeof parsed.bear_case === 'string' &&
+      Array.isArray(parsed.main_risks) &&
+      parsed.main_risks.every((x) => typeof x === 'string') &&
+      typeof parsed.confidence_level === 'string'
+    ) {
+      return {
+        ticker: parsed.ticker,
+        market_view: parsed.market_view,
+        trend: parsed.trend,
+        key_catalysts: parsed.key_catalysts as string[],
+        bull_case: parsed.bull_case,
+        bear_case: parsed.bear_case,
+        main_risks: parsed.main_risks as string[],
+        confidence_level: parsed.confidence_level,
+      }
+    }
+  } catch {
+    // Not JSON; caller renders fallback
+  }
+  return null
+}
+
 const RISK_TOLERANCE_PRESETS = [
   'Conservative/Low',
   'Moderate conservative/Low–moderate',
@@ -100,7 +195,6 @@ function App() {
   const horizonListId = useId()
   const horizonBlurTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const analysisStartRef = useRef<number | null>(null)
-  const agentsActivitiesEndRef = useRef<HTMLDivElement>(null)
 
   const [ticker, setTicker] = useState('AAPL')
   const [focusQuery, setFocusQuery] = useState('')
@@ -108,6 +202,7 @@ function App() {
   const [wsConnected, setWsConnected] = useState(false)
   const [activityEntries, setActivityEntries] = useState<ActivityEntry[]>([])
   const [crewDeliverables, setCrewDeliverables] = useState<CrewDeliverable[]>([])
+  const [agentActivities, setAgentActivities] = useState<AgentActivityItem[]>([])
   const [elapsedSec, setElapsedSec] = useState(0)
   const [lastRunDurationSec, setLastRunDurationSec] = useState<number | null>(null)
   const [draft, setDraft] = useState<string | null>(null)
@@ -129,6 +224,7 @@ function App() {
   const [prefsSaving, setPrefsSaving] = useState(false)
   const [prefsError, setPrefsError] = useState<string | null>(null)
   const [prefsSavedMsg, setPrefsSavedMsg] = useState<string | null>(null)
+  const [profileStepCompleted, setProfileStepCompleted] = useState(false)
   const [horizonMenuOpen, setHorizonMenuOpen] = useState(false)
   const [horizonHighlight, setHorizonHighlight] = useState(-1)
 
@@ -156,6 +252,8 @@ function App() {
         setPreferencesExtra('')
         setPrefsRawPreview(content.trim() || null)
       }
+      // Force explicit profile save before analysis.
+      setProfileStepCompleted(false)
       setPrefsReady(true)
     } catch (e) {
       setPrefsReady(false)
@@ -179,10 +277,6 @@ function App() {
   }, [phase])
 
   useEffect(() => {
-    agentsActivitiesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
-  }, [activityEntries, crewDeliverables])
-
-  useEffect(() => {
     if (!prefsSavedMsg) return
     const t = window.setTimeout(() => setPrefsSavedMsg(null), 4800)
     return () => clearTimeout(t)
@@ -200,8 +294,10 @@ function App() {
           investment_horizon: investmentHorizon.trim() || 'Not specified',
           preferences: preferencesExtra.trim() || 'None',
         })
+        setProfileStepCompleted(true)
         setPrefsSavedMsg(res.message ?? 'Saved')
         await loadPreferences()
+        setProfileStepCompleted(true)
       } catch (err) {
         setPrefsError(err instanceof Error ? err.message : 'Save failed')
       } finally {
@@ -228,6 +324,7 @@ function App() {
 
   function pickHorizonSuggestion(value: string) {
     setInvestmentHorizon(value)
+    setProfileStepCompleted(false)
     setHorizonMenuOpen(false)
     setHorizonHighlight(-1)
   }
@@ -270,6 +367,10 @@ function App() {
       ...prev,
       { id: crypto.randomUUID(), message: line, ts: Date.now() },
     ])
+    setAgentActivities((prev) => [
+      ...prev,
+      { id: crypto.randomUUID(), ts: Date.now(), kind: 'status', message: line },
+    ])
   }, [])
 
   const closeSocket = useCallback(() => {
@@ -286,6 +387,7 @@ function App() {
     setLastRunDurationSec(null)
     setActivityEntries([])
     setCrewDeliverables([])
+    setAgentActivities([])
     setDraft(null)
     setFeedback('')
     setReport(null)
@@ -307,6 +409,7 @@ function App() {
         case 'task_output': {
           const payload = msg.data
           if (!isTaskOutputPayload(payload)) break
+          if (payload.task_name === 'format_json_task') break
           setCrewDeliverables((prev) => [
             ...prev,
             {
@@ -318,7 +421,18 @@ function App() {
               truncated: payload.truncated,
             },
           ])
-          appendLog(formatCrewTaskTitle(payload.task_name))
+          setAgentActivities((prev) => [
+            ...prev,
+            {
+              id: crypto.randomUUID(),
+              ts: Date.now(),
+              kind: 'task_output',
+              task_name: payload.task_name,
+              agent_role: payload.agent_role,
+              output: payload.output,
+              truncated: payload.truncated,
+            },
+          ])
           break
         }
         case 'review_needed':
@@ -422,6 +536,7 @@ function App() {
     setLastRunDurationSec(null)
     setActivityEntries([])
     setCrewDeliverables([])
+    setAgentActivities([])
     setChatMessages([])
     setPhase('running')
 
@@ -482,15 +597,53 @@ function App() {
     appendLog(`Chat: ${q}`)
   }, [appendLog, chatQuestion, report, reportRaw, ticker])
 
+  const analysisLocked = !profileStepCompleted
+  const showProfileWidget = !profileStepCompleted
+  const showAnalysisWidget = profileStepCompleted
+
   function onStartSubmit(e: FormEvent) {
     e.preventDefault()
+    if (analysisLocked) {
+      setSessionError('Step 1 required: save Investment profile first.')
+      return
+    }
     sendStart()
   }
 
   return (
     <div className="min-h-svh bg-zinc-50 text-zinc-900 antialiased dark:bg-zinc-950 dark:text-zinc-100">
       <div className="mx-auto flex max-w-3xl flex-col gap-8 px-4 py-10 sm:px-6">
-        <section className="overflow-hidden rounded-3xl border border-zinc-200/90 bg-white shadow-[0_20px_50px_-12px_rgba(109,40,217,0.12)] ring-1 ring-violet-500/5 dark:border-zinc-800 dark:bg-zinc-900 dark:shadow-[0_20px_50px_-12px_rgba(0,0,0,0.45)] dark:ring-violet-500/10">
+        <section className="rounded-2xl border border-zinc-200/90 bg-white/80 px-4 py-3 dark:border-zinc-800 dark:bg-zinc-900/70">
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <span
+              className={`rounded-full px-2.5 py-1 font-semibold ${
+                profileStepCompleted
+                  ? 'bg-emerald-500/20 text-emerald-900 dark:text-emerald-200'
+                  : 'bg-amber-500/20 text-amber-900 dark:text-amber-200'
+              }`}
+            >
+              1. Update profile
+            </span>
+            <span className="text-zinc-400">→</span>
+            <span
+              className={`rounded-full px-2.5 py-1 font-semibold ${
+                analysisLocked
+                  ? 'bg-zinc-200/80 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300'
+                  : 'bg-violet-500/20 text-violet-900 dark:text-violet-200'
+              }`}
+            >
+              2. Run analysis
+            </span>
+            <span className="ml-auto text-zinc-500 dark:text-zinc-400">
+              {analysisLocked
+                ? 'Save profile to unlock analysis'
+                : 'Profile saved — analysis unlocked'}
+            </span>
+          </div>
+        </section>
+
+        {showProfileWidget && (
+          <section className="overflow-hidden rounded-3xl border border-zinc-200/90 bg-white shadow-[0_20px_50px_-12px_rgba(109,40,217,0.12)] ring-1 ring-violet-500/5 dark:border-zinc-800 dark:bg-zinc-900 dark:shadow-[0_20px_50px_-12px_rgba(0,0,0,0.45)] dark:ring-violet-500/10">
           <div className="relative border-b border-zinc-100 bg-linear-to-br from-violet-500/[0.07] via-white to-fuchsia-500/4 px-5 py-5 sm:px-6 dark:border-zinc-800 dark:from-violet-500/10 dark:via-zinc-900 dark:to-fuchsia-500/5">
             <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
               <div className="flex gap-4">
@@ -508,17 +661,10 @@ function App() {
                 </div>
                 <div>
                   <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-violet-600 dark:text-violet-400">
-                    Knowledge base
+                  Investment Profile
                   </p>
-                  <h2 className="mt-0.5 text-lg font-semibold tracking-tight text-zinc-900 dark:text-white">
-                    Investment profile
-                  </h2>
                   <p className="mt-1.5 max-w-lg text-sm leading-relaxed text-zinc-600 dark:text-zinc-400">
-                    Shapes how the advisor interprets risk and writes reports. Updates{' '}
-                    <code className="rounded-md border border-zinc-200 bg-white/80 px-1.5 py-0.5 font-mono text-[11px] text-zinc-700 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-300">
-                      user_preference.txt
-                    </code>{' '}
-                    for RAG.
+                    Shapes how the advisor interprets risk and writes reports.
                   </p>
                 </div>
               </div>
@@ -541,21 +687,6 @@ function App() {
                     Offline
                   </span>
                 )}
-                <button
-                  type="button"
-                  onClick={() => void loadPreferences()}
-                  disabled={prefsLoading}
-                  className="inline-flex items-center gap-1.5 rounded-xl border border-zinc-200/90 bg-white/90 px-3 py-2 text-xs font-semibold text-zinc-700 shadow-sm transition hover:border-violet-300 hover:bg-violet-50/50 hover:text-violet-900 disabled:pointer-events-none disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-950/80 dark:text-zinc-200 dark:hover:border-violet-500/30 dark:hover:bg-violet-950/30 dark:hover:text-violet-100"
-                >
-                  <svg className="size-3.5 shrink-0 opacity-70" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99"
-                    />
-                  </svg>
-                  Reload
-                </button>
               </div>
             </div>
           </div>
@@ -598,7 +729,7 @@ function App() {
               <div className="rounded-2xl border border-zinc-100 bg-zinc-50/50 p-4 dark:border-zinc-800/80 dark:bg-zinc-950/40">
                 <p className="mb-3 flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-zinc-500 dark:text-zinc-400">
                   <span className="h-px flex-1 bg-linear-to-r from-transparent via-zinc-300 to-transparent dark:via-zinc-600" />
-                  Risk &amp; time horizon
+                  Risk and time horizon
                   <span className="h-px flex-1 bg-linear-to-r from-transparent via-zinc-300 to-transparent dark:via-zinc-600" />
                 </p>
                 <div className="grid gap-4 sm:grid-cols-2">
@@ -607,15 +738,18 @@ function App() {
                       htmlFor="risk-tolerance"
                       className="text-xs font-semibold text-zinc-700 dark:text-zinc-300"
                     >
-                      Risk tolerance
+                      Risk Tolerance
                     </label>
                     <p className="text-[11px] leading-snug text-zinc-500 dark:text-zinc-500">
-                      Band used across the crew for positioning language.
+                      Controls recommendation aggressiveness.
                     </p>
                     <select
                       id="risk-tolerance"
                       value={riskTolerance}
-                      onChange={(e) => setRiskTolerance(e.target.value)}
+                      onChange={(e) => {
+                        setRiskTolerance(e.target.value)
+                        setProfileStepCompleted(false)
+                      }}
                       disabled={prefsLoading}
                       className="mt-0.5 w-full cursor-pointer appearance-none rounded-xl border border-zinc-200 bg-white py-2.5 pl-3 pr-9 text-sm text-zinc-900 shadow-sm outline-none transition focus:border-violet-500 focus:ring-2 focus:ring-violet-500/25 disabled:cursor-not-allowed disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:focus:border-violet-400"
                       style={{
@@ -659,6 +793,7 @@ function App() {
                       value={investmentHorizon}
                       onChange={(e) => {
                         setInvestmentHorizon(e.target.value)
+                        setProfileStepCompleted(false)
                         setHorizonHighlight(-1)
                         openHorizonMenu()
                       }}
@@ -707,7 +842,7 @@ function App() {
               <div className="rounded-2xl border border-zinc-100 bg-zinc-50/50 p-4 dark:border-zinc-800/80 dark:bg-zinc-950/40">
                 <p className="mb-3 flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-zinc-500 dark:text-zinc-400">
                   <span className="h-px flex-1 bg-linear-to-r from-transparent via-zinc-300 to-transparent dark:via-zinc-600" />
-                  Voice &amp; constraints
+                  Voice and constraints
                   <span className="h-px flex-1 bg-linear-to-r from-transparent via-zinc-300 to-transparent dark:via-zinc-600" />
                 </p>
                 <div className="flex flex-col gap-1.5">
@@ -715,7 +850,7 @@ function App() {
                     htmlFor="style-preferences"
                     className="text-xs font-semibold text-zinc-700 dark:text-zinc-300"
                   >
-                    Style &amp; extra preferences
+                    Style and extra preferences
                   </label>
                   <p className="text-[11px] leading-snug text-zinc-500 dark:text-zinc-500">
                     Tone, sectors, length, or anything the advisor should respect.
@@ -723,7 +858,10 @@ function App() {
                   <textarea
                     id="style-preferences"
                     value={preferencesExtra}
-                    onChange={(e) => setPreferencesExtra(e.target.value)}
+                    onChange={(e) => {
+                      setPreferencesExtra(e.target.value)
+                      setProfileStepCompleted(false)
+                    }}
                     placeholder="e.g. Keep bullets short; avoid hype; prefer dividend names…"
                     rows={4}
                     disabled={prefsLoading}
@@ -733,9 +871,6 @@ function App() {
               </div>
 
               <div className="flex flex-col gap-3 border-t border-zinc-100 pt-4 dark:border-zinc-800 sm:flex-row sm:items-center sm:justify-between">
-                <p className="text-[11px] leading-relaxed text-zinc-500 dark:text-zinc-500">
-                  Changes apply on the next analysis. The knowledge task reads this file via RAG.
-                </p>
                 <button
                   type="submit"
                   disabled={prefsLoading || prefsSaving}
@@ -752,7 +887,7 @@ function App() {
                       />
                     </svg>
                   )}
-                  Save to knowledge base
+                  Save Profile
                 </button>
               </div>
             </form>
@@ -776,9 +911,11 @@ function App() {
               </details>
             )}
           </div>
-        </section>
+          </section>
+        )}
 
-        <section className="overflow-hidden rounded-3xl border border-zinc-200/90 bg-white shadow-[0_20px_50px_-12px_rgba(109,40,217,0.1)] ring-1 ring-violet-500/5 dark:border-zinc-800 dark:bg-zinc-900 dark:shadow-[0_20px_50px_-12px_rgba(0,0,0,0.4)] dark:ring-violet-500/10">
+        {showAnalysisWidget && (
+          <section className="overflow-hidden rounded-3xl border border-zinc-200/90 bg-white shadow-[0_20px_50px_-12px_rgba(109,40,217,0.1)] ring-1 ring-violet-500/5 dark:border-zinc-800 dark:bg-zinc-900 dark:shadow-[0_20px_50px_-12px_rgba(0,0,0,0.4)] dark:ring-violet-500/10">
           <div className="relative border-b border-zinc-100 bg-linear-to-br from-violet-600/10 via-white to-fuchsia-500/5 px-5 py-6 sm:px-6 dark:border-zinc-800 dark:from-violet-500/15 dark:via-zinc-900 dark:to-fuchsia-500/8">
             <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
               <div className="flex gap-4">
@@ -795,12 +932,9 @@ function App() {
                   </svg>
                 </div>
                 <div>
-                  <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-violet-600 dark:text-violet-400">
-                    CrewAI · Human in the loop
+                  <p className="text-lg font-semibold tracking-tight text-violet-700 dark:text-violet-300">
+                    Agentic Stock Analyst
                   </p>
-                  <h1 className="mt-1 text-2xl font-semibold tracking-tight text-zinc-900 sm:text-3xl dark:text-white">
-                    Agentic stock analyst
-                  </h1>
                   <p className="mt-2 max-w-xl text-sm leading-relaxed text-zinc-600 dark:text-zinc-400">
                     Multi-agent research, a review pause for your feedback, then structured JSON — with a live trace of
                     what the crew is doing.
@@ -819,7 +953,9 @@ function App() {
                   </span>
                   <span
                     className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${
-                      phase === 'running'
+                      analysisLocked
+                        ? 'bg-zinc-200/80 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300'
+                        : phase === 'running'
                         ? 'bg-violet-500/20 text-violet-800 dark:bg-violet-500/25 dark:text-violet-200'
                         : phase === 'awaiting_feedback'
                           ? 'bg-amber-500/20 text-amber-900 dark:bg-amber-500/20 dark:text-amber-100'
@@ -830,7 +966,7 @@ function App() {
                               : 'bg-zinc-200/80 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300'
                     }`}
                   >
-                    {analysisPhaseLabel(phase)}
+                    {analysisLocked ? 'Profile required' : analysisPhaseLabel(phase)}
                   </span>
                 </div>
                 <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-600 dark:text-zinc-400">
@@ -893,7 +1029,7 @@ function App() {
                       value={ticker}
                       onChange={(e) => setTicker(e.target.value.toUpperCase())}
                       placeholder="e.g. TSLA"
-                      disabled={phase === 'running' || phase === 'awaiting_feedback'}
+                      disabled={analysisLocked || phase === 'running' || phase === 'awaiting_feedback'}
                       className="w-full rounded-xl border border-zinc-200 bg-white px-3 py-2.5 text-base font-semibold tabular-nums tracking-wide outline-none transition focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-900 dark:text-white"
                     />
                   </div>
@@ -911,7 +1047,7 @@ function App() {
                       onChange={(e) => setFocusQuery(e.target.value)}
                       placeholder="What should the crew emphasize? Catalysts, valuation, risks, comparables…"
                       rows={3}
-                      disabled={phase === 'running' || phase === 'awaiting_feedback'}
+                      disabled={analysisLocked || phase === 'running' || phase === 'awaiting_feedback'}
                       className="w-full resize-y rounded-xl border border-zinc-200 bg-white px-3 py-2.5 text-sm outline-none transition focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
                     />
                   </div>
@@ -919,7 +1055,12 @@ function App() {
                 <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center">
                   <button
                     type="submit"
-                    disabled={!ticker.trim() || phase === 'running' || phase === 'awaiting_feedback'}
+                    disabled={
+                      analysisLocked ||
+                      !ticker.trim() ||
+                      phase === 'running' ||
+                      phase === 'awaiting_feedback'
+                    }
                     className="inline-flex flex-1 items-center justify-center gap-2 rounded-xl bg-linear-to-r from-violet-600 to-fuchsia-600 px-5 py-2.5 text-sm font-semibold text-white shadow-md shadow-violet-500/25 transition hover:from-violet-500 hover:to-fuchsia-500 disabled:cursor-not-allowed disabled:opacity-50 disabled:shadow-none sm:flex-none dark:shadow-violet-900/30"
                   >
                     {(phase === 'running' || phase === 'awaiting_feedback') && (
@@ -929,7 +1070,9 @@ function App() {
                       ? 'Analysis in progress…'
                       : phase === 'awaiting_feedback'
                         ? 'Waiting for your review…'
-                        : 'Run analysis'}
+                        : analysisLocked
+                          ? 'Complete profile first'
+                          : 'Run analysis'}
                   </button>
                   <button
                     type="button"
@@ -939,6 +1082,11 @@ function App() {
                     New session
                   </button>
                 </div>
+                {analysisLocked && (
+                  <p className="mt-3 rounded-lg border border-amber-200/80 bg-amber-50/70 px-3 py-2 text-xs text-amber-900 dark:border-amber-900/40 dark:bg-amber-950/30 dark:text-amber-100">
+                    Step 2 is locked. Update and save your Investment profile first.
+                  </p>
+                )}
               </div>
             </form>
 
@@ -980,52 +1128,45 @@ function App() {
                       </span>
                     )}
                     <span className="rounded-full bg-zinc-200/80 px-2.5 py-0.5 text-[11px] font-semibold tabular-nums text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200">
-                      {activityEntries.length} update{activityEntries.length === 1 ? '' : 's'} ·{' '}
-                      {crewDeliverables.length} task{crewDeliverables.length === 1 ? '' : 's'}
+                      {agentActivities.length} item{agentActivities.length === 1 ? '' : 's'}
                     </span>
                   </div>
                 </div>
 
-                <div className="max-h-128 space-y-4 overflow-y-auto p-3 sm:max-h-144">
-                  <div>
-                    <p className="mb-2 px-1 text-[10px] font-bold uppercase tracking-wider text-zinc-500 dark:text-zinc-500">
-                      Status
-                    </p>
-                    {activityEntries.length === 0 &&
-                      (phase === 'running' || phase === 'awaiting_feedback') && (
-                        <p className="px-2 py-4 text-center text-sm text-zinc-500 dark:text-zinc-400">
-                          <span className="inline-flex items-center gap-2">
-                            <SearchSpinner className="size-4" />
-                            Waiting for the first status…
-                          </span>
-                        </p>
-                      )}
-                    <ul className="space-y-1">
-                      {activityEntries.map((entry, i) => {
-                        const isLatest = i === activityEntries.length - 1
-                        const livePulse =
-                          isLatest && (phase === 'running' || phase === 'awaiting_feedback')
+                <div className="p-3">
+                  {agentActivities.length === 0 &&
+                    (phase === 'running' || phase === 'awaiting_feedback') && (
+                      <p className="px-2 py-6 text-center text-sm text-zinc-500 dark:text-zinc-400">
+                        <span className="inline-flex items-center gap-2">
+                          <SearchSpinner className="size-4" />
+                          Waiting for activity from the crew…
+                        </span>
+                      </p>
+                    )}
+                  <ul className="divide-y divide-zinc-200/70 dark:divide-zinc-800">
+                    {agentActivities.map((item, i) => {
+                      if (item.kind === 'task_output' && item.task_name === 'format_json_task') {
+                        return null
+                      }
+                      const isLatest = i === agentActivities.length - 1
+                      const livePulse =
+                        isLatest && (phase === 'running' || phase === 'awaiting_feedback')
+                      if (item.kind === 'status') {
                         return (
-                          <li key={entry.id}>
-                            <div
-                              className={`flex gap-3 rounded-xl px-3 py-2.5 transition ${
-                                livePulse
-                                  ? 'bg-violet-50/90 ring-1 ring-violet-200/80 dark:bg-violet-950/40 dark:ring-violet-500/25'
-                                  : 'hover:bg-white/80 dark:hover:bg-zinc-900/60'
-                              }`}
-                            >
+                          <li key={item.id} className="py-2.5">
+                            <div className="flex gap-3 px-1">
                               <time
                                 className="shrink-0 tabular-nums text-[10px] font-medium text-zinc-400 dark:text-zinc-500"
-                                dateTime={new Date(entry.ts).toISOString()}
+                                dateTime={new Date(item.ts).toISOString()}
                               >
-                                {new Date(entry.ts).toLocaleTimeString(undefined, {
+                                {new Date(item.ts).toLocaleTimeString(undefined, {
                                   hour: '2-digit',
                                   minute: '2-digit',
                                   second: '2-digit',
                                 })}
                               </time>
                               <p className="min-w-0 flex-1 text-sm leading-snug text-zinc-800 dark:text-zinc-200">
-                                {entry.message}
+                                {item.message}
                               </p>
                               {livePulse && (
                                 <span
@@ -1036,73 +1177,171 @@ function App() {
                             </div>
                           </li>
                         )
-                      })}
-                    </ul>
-                  </div>
-
-                  <div className="border-t border-zinc-200/70 pt-3 dark:border-zinc-800">
-                    <p className="mb-2 px-1 text-[10px] font-bold uppercase tracking-wider text-zinc-500 dark:text-zinc-500">
-                      Task outputs
-                    </p>
-                    {crewDeliverables.length === 0 &&
-                      (phase === 'running' || phase === 'awaiting_feedback') && (
-                        <p className="px-2 py-4 text-center text-sm text-zinc-500 dark:text-zinc-400">
-                          <span className="inline-flex items-center gap-2">
-                            <SearchSpinner className="size-4 text-violet-500" />
-                            Waiting for the first completed task…
-                          </span>
-                        </p>
-                      )}
-                    <div className="space-y-2">
-                      {crewDeliverables.map((d) => (
-                        <details
-                          key={d.id}
-                          className="group rounded-xl border border-zinc-200/90 bg-white/90 open:ring-2 open:ring-violet-400/30 dark:border-zinc-700 dark:bg-zinc-900/80 dark:open:ring-violet-500/25"
-                        >
-                          <summary className="flex cursor-pointer list-none flex-wrap items-center justify-between gap-2 px-3 py-2.5 marker:hidden [&::-webkit-details-marker]:hidden">
-                            <span className="min-w-0 font-semibold text-zinc-900 dark:text-white">
-                              {formatCrewTaskTitle(d.task_name)}
-                            </span>
-                            <span className="text-[10px] text-zinc-400 group-open:hidden dark:text-zinc-500">
-                              Tap to expand
-                            </span>
-                          </summary>
-                          <div className="border-t border-zinc-100 px-3 py-2 dark:border-zinc-800">
-                            {d.agent_role ? (
-                              <p className="mb-2 text-[11px] text-zinc-500 dark:text-zinc-400">
-                                {d.agent_role}
-                              </p>
-                            ) : null}
-                            {d.truncated && (
-                              <p className="mb-2 text-[11px] font-medium text-amber-700 dark:text-amber-400">
-                                Output was truncated for the browser; full text may be in server logs.
-                              </p>
-                            )}
-                            <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded-lg bg-zinc-50 p-3 font-mono text-[11px] leading-relaxed text-zinc-800 dark:bg-zinc-950 dark:text-zinc-200">
-                              {d.output}
-                            </pre>
-                            <time
-                              className="mt-2 block text-[10px] text-zinc-400 dark:text-zinc-500"
-                              dateTime={new Date(d.ts).toISOString()}
-                            >
-                              {new Date(d.ts).toLocaleTimeString(undefined, {
-                                hour: '2-digit',
-                                minute: '2-digit',
-                                second: '2-digit',
-                              })}
-                            </time>
+                      }
+                      const parsedPriceTask =
+                        item.task_name === 'analyze_price_task'
+                          ? parsePriceTaskResult(item.output)
+                          : null
+                      const parsedJsonTask =
+                        item.task_name === 'format_json_task'
+                          ? parseJsonTaskResult(item.output)
+                          : null
+                      return (
+                        <li key={item.id} className="py-3">
+                          <div>
+                            <div className="flex flex-wrap items-center justify-between gap-2 px-1 py-0.5">
+                              <span className="inline-flex items-center gap-2 min-w-0 font-semibold text-zinc-900 dark:text-white">
+                                <span className="size-1.5 rounded-full bg-violet-500" aria-hidden />
+                                {formatCrewTaskTitle(item.task_name)}
+                              </span>
+                            </div>
+                            <div className="px-1 pb-0 pt-2">
+                              {item.truncated && (
+                                <p className="mb-2 text-[11px] font-medium text-amber-800 dark:text-amber-300">
+                                  Output was truncated for the browser; full text may be in server logs.
+                                </p>
+                              )}
+                              {parsedPriceTask ? (
+                                <div className="space-y-3 rounded-xl bg-zinc-50/70 p-3 dark:bg-zinc-900/40">
+                                  <div className="grid gap-2 sm:grid-cols-3">
+                                    <div className="rounded-lg bg-white/90 px-2.5 py-2 dark:bg-zinc-950/70">
+                                      <p className="text-[10px] uppercase tracking-wide text-zinc-500">
+                                        Trend
+                                      </p>
+                                      <span
+                                        className={`mt-1 inline-flex rounded-full px-2 py-0.5 text-xs font-semibold capitalize ${trendBadgeStyles(
+                                          parsedPriceTask.trend,
+                                        )}`}
+                                      >
+                                        {parsedPriceTask.trend}
+                                      </span>
+                                    </div>
+                                    <div className="rounded-lg bg-white/90 px-2.5 py-2 dark:bg-zinc-950/70">
+                                      <p className="text-[10px] uppercase tracking-wide text-zinc-500">
+                                        30D Change
+                                      </p>
+                                      <p
+                                        className={`mt-1 text-sm font-semibold tabular-nums ${
+                                          parsedPriceTask.price_change_30d > 0
+                                            ? 'text-emerald-700 dark:text-emerald-300'
+                                            : parsedPriceTask.price_change_30d < 0
+                                              ? 'text-rose-700 dark:text-rose-300'
+                                              : 'text-zinc-700 dark:text-zinc-300'
+                                        }`}
+                                      >
+                                        {parsedPriceTask.price_change_30d > 0 ? '+' : ''}
+                                        {parsedPriceTask.price_change_30d.toFixed(2)}%
+                                      </p>
+                                    </div>
+                                    <div className="rounded-lg bg-white/90 px-2.5 py-2 dark:bg-zinc-950/70">
+                                      <p className="text-[10px] uppercase tracking-wide text-zinc-500">
+                                        Volume
+                                      </p>
+                                      <span
+                                        className={`mt-1 inline-flex rounded-full px-2 py-0.5 text-xs font-semibold capitalize ${volumeBadgeStyles(
+                                          parsedPriceTask.volume_signal,
+                                        )}`}
+                                      >
+                                        {parsedPriceTask.volume_signal}
+                                      </span>
+                                    </div>
+                                  </div>
+                                  <p className="text-xs leading-relaxed text-zinc-700 dark:text-zinc-200">
+                                    {parsedPriceTask.summary}
+                                  </p>
+                                </div>
+                              ) : parsedJsonTask ? (
+                                <div className="space-y-3 rounded-xl bg-zinc-50/70 p-3 dark:bg-zinc-900/40">
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <span className="text-lg font-semibold tabular-nums text-zinc-900 dark:text-white">
+                                      {parsedJsonTask.ticker}
+                                    </span>
+                                    <span
+                                      className={`inline-flex rounded-full px-2 py-0.5 text-xs font-semibold capitalize ${trendBadgeStyles(
+                                        parsedJsonTask.trend,
+                                      )}`}
+                                    >
+                                      {parsedJsonTask.trend}
+                                    </span>
+                                    <span className="inline-flex rounded-full bg-violet-500/15 px-2 py-0.5 text-xs font-semibold text-violet-900 dark:text-violet-200">
+                                      Confidence: {parsedJsonTask.confidence_level}
+                                    </span>
+                                  </div>
+                                  <div className="rounded-lg bg-white/90 px-2.5 py-2 dark:bg-zinc-950/70">
+                                    <p className="text-[10px] uppercase tracking-wide text-zinc-500">
+                                      Market view
+                                    </p>
+                                    <p className="mt-1 text-xs leading-relaxed text-zinc-700 dark:text-zinc-200">
+                                      {parsedJsonTask.market_view}
+                                    </p>
+                                  </div>
+                                  <div className="grid gap-2 sm:grid-cols-2">
+                                    <div className="rounded-lg bg-emerald-500/10 px-2.5 py-2">
+                                      <p className="text-[10px] uppercase tracking-wide text-emerald-800 dark:text-emerald-300">
+                                        Bull case
+                                      </p>
+                                      <p className="mt-1 text-xs leading-relaxed text-zinc-700 dark:text-zinc-200">
+                                        {parsedJsonTask.bull_case}
+                                      </p>
+                                    </div>
+                                    <div className="rounded-lg bg-rose-500/10 px-2.5 py-2">
+                                      <p className="text-[10px] uppercase tracking-wide text-rose-800 dark:text-rose-300">
+                                        Bear case
+                                      </p>
+                                      <p className="mt-1 text-xs leading-relaxed text-zinc-700 dark:text-zinc-200">
+                                        {parsedJsonTask.bear_case}
+                                      </p>
+                                    </div>
+                                  </div>
+                                  <div className="rounded-lg bg-white/90 px-2.5 py-2 dark:bg-zinc-950/70">
+                                    <p className="text-[10px] uppercase tracking-wide text-zinc-500">
+                                      Key catalysts
+                                    </p>
+                                    <ul className="mt-1 list-disc space-y-1 pl-4 text-xs leading-relaxed text-zinc-700 dark:text-zinc-200">
+                                      {parsedJsonTask.key_catalysts.map((c, idx) => (
+                                        <li key={`${idx}-${c.slice(0, 20)}`}>{c}</li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                  <div className="rounded-lg bg-white/90 px-2.5 py-2 dark:bg-zinc-950/70">
+                                    <p className="text-[10px] uppercase tracking-wide text-zinc-500">
+                                      Main risks
+                                    </p>
+                                    <ul className="mt-1 list-disc space-y-1 pl-4 text-xs leading-relaxed text-zinc-700 dark:text-zinc-200">
+                                      {parsedJsonTask.main_risks.map((r, idx) => (
+                                        <li key={`${idx}-${r.slice(0, 20)}`}>{r}</li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                </div>
+                              ) : (
+                                <pre className="whitespace-pre-wrap font-mono text-xs leading-relaxed text-zinc-800 dark:text-zinc-200">
+                                  {item.output}
+                                </pre>
+                              )}
+                              <time
+                                className="mt-2 block text-[10px] font-medium text-zinc-400 dark:text-zinc-500"
+                                dateTime={new Date(item.ts).toISOString()}
+                              >
+                                {new Date(item.ts).toLocaleTimeString(undefined, {
+                                  hour: '2-digit',
+                                  minute: '2-digit',
+                                  second: '2-digit',
+                                })}
+                              </time>
+                            </div>
                           </div>
-                        </details>
-                      ))}
-                    </div>
-                  </div>
+                        </li>
+                      )
+                    })}
+                  </ul>
 
-                  <div ref={agentsActivitiesEndRef} />
                 </div>
               </div>
             )}
           </div>
-        </section>
+          </section>
+        )}
 
         {draft !== null && phase === 'awaiting_feedback' && (
           <section className="flex flex-col gap-4 overflow-hidden rounded-3xl border border-amber-200/80 bg-linear-to-br from-amber-50/90 to-white p-6 shadow-lg shadow-amber-900/5 dark:border-amber-900/45 dark:from-amber-950/35 dark:to-zinc-900 dark:shadow-none">
