@@ -8,19 +8,19 @@ import {
   useRef,
   useState,
 } from 'react'
-import { fetchTickerAutocomplete } from './api/autocomplete'
-import { fetchStockQuote } from './api/quote'
-import { fetchPopularTickers } from './api/tickers'
-import type { Momentum, StockQuoteResponse, Trend } from './types/quote'
-import type { TickerEntry, TickerSuggestion } from './types/tickers'
-
-type DisplayRow = {
-  symbol: string
-  name: string
-  meta?: string
-}
-
-const SUGGEST_DEBOUNCE_MS = 220
+import {
+  fetchPreferences,
+  parsePreferencesContent,
+  updatePreferences,
+} from './api/preferences'
+import { ANALYZE_WEBSOCKET_PATH, getAnalyzeWebSocketUrl } from './lib/backendUrl'
+import {
+  type FinalReportData,
+  isFinalReportData,
+  isTaskOutputPayload,
+  type AnalyzeServerMessage,
+  type TaskOutputPayload,
+} from './types/agent'
 
 function SearchSpinner({ className }: { className?: string }) {
   return (
@@ -32,551 +32,1243 @@ function SearchSpinner({ className }: { className?: string }) {
   )
 }
 
-function formatPct(value: number | null | undefined): string {
-  if (value == null || Number.isNaN(value)) return '—'
-  const sign = value > 0 ? '+' : ''
-  return `${sign}${value.toFixed(2)}%`
+type SessionPhase = 'idle' | 'running' | 'awaiting_feedback' | 'done' | 'failed'
+
+type ActivityEntry = {
+  id: string
+  message: string
+  ts: number
 }
 
-function pctColor(value: number | null | undefined): string {
-  if (value == null || Number.isNaN(value)) {
-    return 'text-zinc-500 dark:text-zinc-400'
-  }
-  if (value > 0) return 'text-emerald-600 dark:text-emerald-400'
-  if (value < 0) return 'text-rose-600 dark:text-rose-400'
-  return 'text-zinc-600 dark:text-zinc-300'
+type CrewDeliverable = TaskOutputPayload & { id: string; ts: number }
+
+function formatDuration(totalSec: number): string {
+  const m = Math.floor(totalSec / 60)
+  const s = totalSec % 60
+  if (m <= 0) return `${s}s`
+  return `${m}m ${s.toString().padStart(2, '0')}s`
 }
 
-function trendStyles(t: Trend): string {
-  switch (t) {
-    case 'bullish':
-      return 'bg-emerald-500/15 text-emerald-700 ring-emerald-500/30 dark:text-emerald-300'
-    case 'bearish':
-      return 'bg-rose-500/15 text-rose-700 ring-rose-500/30 dark:text-rose-300'
+/** Crew task keys e.g. `review_report_task` → "Review Report Task" */
+function formatCrewTaskTitle(raw: string): string {
+  const s = raw.trim()
+  if (!s) return 'Task'
+  return s
+    .split('_')
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join(' ')
+}
+
+function analysisPhaseLabel(phase: SessionPhase): string {
+  switch (phase) {
+    case 'idle':
+      return 'Ready'
+    case 'running':
+      return 'Agents working'
+    case 'awaiting_feedback':
+      return 'Your review'
+    case 'done':
+      return 'Complete'
+    case 'failed':
+      return 'Stopped'
     default:
-      return 'bg-amber-500/15 text-amber-800 ring-amber-500/30 dark:text-amber-200'
+      return '—'
   }
 }
 
-function momentumStyles(m: Momentum): string {
-  switch (m) {
-    case 'strong':
-      return 'bg-violet-500/15 text-violet-800 ring-violet-500/30 dark:text-violet-200'
-    case 'weak':
-      return 'bg-slate-500/20 text-slate-700 ring-slate-500/25 dark:text-slate-300'
-    default:
-      return 'bg-sky-500/15 text-sky-800 ring-sky-500/30 dark:text-sky-200'
-  }
-}
+const RISK_TOLERANCE_PRESETS = [
+  'Conservative/Low',
+  'Moderate conservative/Low–moderate',
+  'Moderate/Medium',
+  'Moderate aggressive/Medium–high',
+  'Aggressive/High',
+  'Speculative/Very high',
+] as const
 
-function suggestionToRows(items: TickerSuggestion[]): DisplayRow[] {
-  return items.map((s) => ({
-    symbol: s.symbol,
-    name: s.name,
-    meta: [s.exchange, s.kind].filter(Boolean).join(' · ') || undefined,
-  }))
-}
-
-function filterPopular(popular: TickerEntry[], q: string): DisplayRow[] {
-  const t = q.trim().toLowerCase()
-  if (!t) return []
-  return popular
-    .filter(
-      (p) =>
-        p.symbol.toLowerCase().includes(t) || p.name.toLowerCase().includes(t),
-    )
-    .slice(0, 10)
-    .map((p) => ({ symbol: p.symbol, name: p.name, meta: 'Popular list' }))
-}
-
-function getLiveQuoteWsUrl(ticker: string): string {
-  const symbol = encodeURIComponent(ticker.trim().toUpperCase())
-  const explicitBase = import.meta.env.VITE_API_BASE as string | undefined
-
-  if (explicitBase && explicitBase.length > 0) {
-    const base = new URL(explicitBase)
-    const wsProtocol = base.protocol === 'https:' ? 'wss:' : 'ws:'
-    return `${wsProtocol}//${base.host}/api/stock/live/${symbol}`
-  }
-
-  const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${wsProtocol}//${window.location.host}/api/stock/live/${symbol}`
-}
+const INVESTMENT_HORIZON_PRESETS = [
+  'Under 1 year',
+  '1–3 years',
+  '3–5 years',
+  '5–10 years',
+  '10+ years',
+  'Retirement/long-term',
+] as const
 
 function App() {
-  const listId = useId()
-  const inputRef = useRef<HTMLInputElement>(null)
-  const blurCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const wsRef = useRef<WebSocket | null>(null)
+  const horizonListId = useId()
+  const horizonBlurTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const analysisStartRef = useRef<number | null>(null)
+  const agentsActivitiesEndRef = useRef<HTMLDivElement>(null)
 
-  const [query, setQuery] = useState('AAPL')
-  const [data, setData] = useState<StockQuoteResponse | null>(null)
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [liveConnected, setLiveConnected] = useState(false)
-  const [liveConnecting, setLiveConnecting] = useState(false)
-  const [liveError, setLiveError] = useState<string | null>(null)
-  const [lastLiveTs, setLastLiveTs] = useState<number | null>(null)
-
-  const [popular, setPopular] = useState<TickerEntry[]>([])
-  const [remoteRows, setRemoteRows] = useState<DisplayRow[]>([])
-  const [suggestLoading, setSuggestLoading] = useState(false)
-  const [debouncingSearch, setDebouncingSearch] = useState(false)
-  const [menuOpen, setMenuOpen] = useState(false)
-  const [highlightIndex, setHighlightIndex] = useState(-1)
-
-  useEffect(() => {
-    void fetchPopularTickers()
-      .then((r) => setPopular(r.tickers))
-      .catch(() => setPopular([]))
-  }, [])
-
-  const trimmed = query.trim()
-  const displayRows = useMemo((): DisplayRow[] => {
-    if (!trimmed) {
-      return popular.slice(0, 12).map((p) => ({
-        symbol: p.symbol,
-        name: p.name,
-        meta: 'Popular',
-      }))
-    }
-    if (remoteRows.length > 0) return remoteRows
-    return filterPopular(popular, trimmed)
-  }, [trimmed, popular, remoteRows])
-
-  const searchInFlight = debouncingSearch || suggestLoading
-
-  useEffect(() => {
-    if (!trimmed) {
-      setRemoteRows([])
-      setSuggestLoading(false)
-      setDebouncingSearch(false)
-      return
-    }
-
-    setDebouncingSearch(true)
-    setRemoteRows([])
-    let cancelled = false
-    const t = window.setTimeout(() => {
-      setDebouncingSearch(false)
-      void (async () => {
-        setSuggestLoading(true)
-        try {
-          const res = await fetchTickerAutocomplete(trimmed)
-          if (!cancelled) {
-            setRemoteRows(suggestionToRows(res.suggestions))
-            setHighlightIndex(-1)
-          }
-        } catch {
-          if (!cancelled) {
-            setRemoteRows([])
-          }
-        } finally {
-          if (!cancelled) {
-            setSuggestLoading(false)
-          }
-        }
-      })()
-    }, SUGGEST_DEBOUNCE_MS)
-
-    return () => {
-      cancelled = true
-      clearTimeout(t)
-      setDebouncingSearch(false)
-    }
-  }, [trimmed])
-
-  const fetchQuote = useCallback(async (ticker: string) => {
-    const sym = ticker.trim().toUpperCase()
-    if (!sym) return
-    setError(null)
-    setLoading(true)
-    setMenuOpen(false)
-    setHighlightIndex(-1)
-    try {
-      const quote = await fetchStockQuote(sym)
-      setData(quote)
-    } catch (err) {
-      setData(null)
-      setError(err instanceof Error ? err.message : 'Something went wrong')
-    } finally {
-      setLoading(false)
-    }
-  }, [])
-
-  const pickRow = useCallback(
-    (symbol: string) => {
-      const sym = symbol.trim().toUpperCase()
-      setQuery(sym)
-      void fetchQuote(sym)
-    },
-    [fetchQuote],
+  const [ticker, setTicker] = useState('AAPL')
+  const [focusQuery, setFocusQuery] = useState('')
+  const [phase, setPhase] = useState<SessionPhase>('idle')
+  const [wsConnected, setWsConnected] = useState(false)
+  const [activityEntries, setActivityEntries] = useState<ActivityEntry[]>([])
+  const [crewDeliverables, setCrewDeliverables] = useState<CrewDeliverable[]>([])
+  const [elapsedSec, setElapsedSec] = useState(0)
+  const [lastRunDurationSec, setLastRunDurationSec] = useState<number | null>(null)
+  const [draft, setDraft] = useState<string | null>(null)
+  const [feedback, setFeedback] = useState('')
+  const [report, setReport] = useState<FinalReportData | null>(null)
+  const [reportRaw, setReportRaw] = useState<string | null>(null)
+  const [sessionError, setSessionError] = useState<string | null>(null)
+  const [chatQuestion, setChatQuestion] = useState('')
+  const [chatMessages, setChatMessages] = useState<{ role: 'user' | 'advisor'; text: string }[]>(
+    [],
   )
 
+  const [riskTolerance, setRiskTolerance] = useState('')
+  const [investmentHorizon, setInvestmentHorizon] = useState('')
+  const [preferencesExtra, setPreferencesExtra] = useState('')
+  const [prefsRawPreview, setPrefsRawPreview] = useState<string | null>(null)
+  const [prefsReady, setPrefsReady] = useState(false)
+  const [prefsLoading, setPrefsLoading] = useState(true)
+  const [prefsSaving, setPrefsSaving] = useState(false)
+  const [prefsError, setPrefsError] = useState<string | null>(null)
+  const [prefsSavedMsg, setPrefsSavedMsg] = useState<string | null>(null)
+  const [horizonMenuOpen, setHorizonMenuOpen] = useState(false)
+  const [horizonHighlight, setHorizonHighlight] = useState(-1)
+
+  const horizonSuggestions = useMemo(() => {
+    const q = investmentHorizon.trim().toLowerCase()
+    if (!q) return [...INVESTMENT_HORIZON_PRESETS]
+    return INVESTMENT_HORIZON_PRESETS.filter((opt) => opt.toLowerCase().includes(q))
+  }, [investmentHorizon])
+
+  const loadPreferences = useCallback(async () => {
+    setPrefsLoading(true)
+    setPrefsError(null)
+    setPrefsSavedMsg(null)
+    try {
+      const { content } = await fetchPreferences()
+      const parsed = parsePreferencesContent(content)
+      if (parsed) {
+        setRiskTolerance(parsed.risk_tolerance ?? '')
+        setInvestmentHorizon(parsed.investment_horizon ?? '')
+        setPreferencesExtra(parsed.preferences ?? '')
+        setPrefsRawPreview(null)
+      } else {
+        setRiskTolerance('')
+        setInvestmentHorizon('')
+        setPreferencesExtra('')
+        setPrefsRawPreview(content.trim() || null)
+      }
+      setPrefsReady(true)
+    } catch (e) {
+      setPrefsReady(false)
+      setPrefsError(e instanceof Error ? e.message : 'Could not load preferences')
+    } finally {
+      setPrefsLoading(false)
+    }
+  }, [])
+
   useEffect(() => {
-    if (!data?.ticker) {
-      setLiveConnected(false)
-      setLiveConnecting(false)
-      setLiveError(null)
+    void loadPreferences()
+  }, [loadPreferences])
+
+  useEffect(() => {
+    if (phase !== 'running' && phase !== 'awaiting_feedback') return
+    const id = window.setInterval(() => {
+      const t = analysisStartRef.current
+      if (t != null) setElapsedSec(Math.floor((Date.now() - t) / 1000))
+    }, 400)
+    return () => clearInterval(id)
+  }, [phase])
+
+  useEffect(() => {
+    agentsActivitiesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+  }, [activityEntries, crewDeliverables])
+
+  useEffect(() => {
+    if (!prefsSavedMsg) return
+    const t = window.setTimeout(() => setPrefsSavedMsg(null), 4800)
+    return () => clearTimeout(t)
+  }, [prefsSavedMsg])
+
+  const savePreferences = useCallback(
+    async (e: FormEvent) => {
+      e.preventDefault()
+      setPrefsSaving(true)
+      setPrefsError(null)
+      setPrefsSavedMsg(null)
+      try {
+        const res = await updatePreferences({
+          risk_tolerance: riskTolerance.trim() || 'Not specified',
+          investment_horizon: investmentHorizon.trim() || 'Not specified',
+          preferences: preferencesExtra.trim() || 'None',
+        })
+        setPrefsSavedMsg(res.message ?? 'Saved')
+        await loadPreferences()
+      } catch (err) {
+        setPrefsError(err instanceof Error ? err.message : 'Save failed')
+      } finally {
+        setPrefsSaving(false)
+      }
+    },
+    [investmentHorizon, loadPreferences, preferencesExtra, riskTolerance],
+  )
+
+  function openHorizonMenu() {
+    if (horizonBlurTimer.current) {
+      clearTimeout(horizonBlurTimer.current)
+      horizonBlurTimer.current = null
+    }
+    setHorizonMenuOpen(true)
+  }
+
+  function closeHorizonMenuSoon() {
+    horizonBlurTimer.current = setTimeout(() => {
+      setHorizonMenuOpen(false)
+      setHorizonHighlight(-1)
+    }, 120)
+  }
+
+  function pickHorizonSuggestion(value: string) {
+    setInvestmentHorizon(value)
+    setHorizonMenuOpen(false)
+    setHorizonHighlight(-1)
+  }
+
+  function onHorizonKeyDown(e: KeyboardEvent<HTMLInputElement>) {
+    if (!horizonMenuOpen && (e.key === 'ArrowDown' || e.key === 'ArrowUp') && horizonSuggestions.length > 0) {
+      e.preventDefault()
+      setHorizonMenuOpen(true)
+      setHorizonHighlight(e.key === 'ArrowDown' ? 0 : horizonSuggestions.length - 1)
       return
     }
+    if (!horizonMenuOpen) return
 
-    const ws = new WebSocket(getLiveQuoteWsUrl(data.ticker))
-    setLiveConnecting(true)
-    setLiveConnected(false)
-    setLiveError(null)
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      setHorizonMenuOpen(false)
+      setHorizonHighlight(-1)
+      return
+    }
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      setHorizonHighlight((i) =>
+        horizonSuggestions.length ? Math.min(i + 1, horizonSuggestions.length - 1) : -1,
+      )
+      return
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      setHorizonHighlight((i) => (horizonSuggestions.length ? Math.max(i - 1, 0) : -1))
+      return
+    }
+    if (e.key === 'Enter' && horizonHighlight >= 0 && horizonSuggestions[horizonHighlight]) {
+      e.preventDefault()
+      pickHorizonSuggestion(horizonSuggestions[horizonHighlight])
+    }
+  }
+
+  const appendLog = useCallback((line: string) => {
+    setActivityEntries((prev) => [
+      ...prev,
+      { id: crypto.randomUUID(), message: line, ts: Date.now() },
+    ])
+  }, [])
+
+  const closeSocket = useCallback(() => {
+    wsRef.current?.close()
+    wsRef.current = null
+    setWsConnected(false)
+  }, [])
+
+  const resetSession = useCallback(() => {
+    closeSocket()
+    setPhase('idle')
+    analysisStartRef.current = null
+    setElapsedSec(0)
+    setLastRunDurationSec(null)
+    setActivityEntries([])
+    setCrewDeliverables([])
+    setDraft(null)
+    setFeedback('')
+    setReport(null)
+    setReportRaw(null)
+    setSessionError(null)
+    setChatMessages([])
+    setChatQuestion('')
+  }, [closeSocket])
+
+  const handleServerMessage = useCallback(
+    (raw: unknown) => {
+      const msg = raw as AnalyzeServerMessage
+      if (!msg || typeof msg !== 'object' || !('type' in msg)) return
+
+      switch (msg.type) {
+        case 'status':
+          appendLog(typeof msg.data === 'string' ? msg.data : String(msg.data))
+          break
+        case 'task_output': {
+          const payload = msg.data
+          if (!isTaskOutputPayload(payload)) break
+          setCrewDeliverables((prev) => [
+            ...prev,
+            {
+              id: crypto.randomUUID(),
+              ts: Date.now(),
+              task_name: payload.task_name,
+              agent_role: payload.agent_role,
+              output: payload.output,
+              truncated: payload.truncated,
+            },
+          ])
+          appendLog(formatCrewTaskTitle(payload.task_name))
+          break
+        }
+        case 'review_needed':
+          setDraft(typeof msg.data === 'string' ? msg.data : String(msg.data))
+          setPhase('awaiting_feedback')
+          appendLog('Draft ready — please review and send feedback.')
+          break
+        case 'complete': {
+          const data = msg.data
+          if (isFinalReportData(data)) {
+            setReport(data)
+            setReportRaw(null)
+          } else if (typeof data === 'string') {
+            setReport(null)
+            setReportRaw(data)
+          } else {
+            setReport(null)
+            setReportRaw(JSON.stringify(data, null, 2))
+          }
+          setDraft(null)
+          setPhase('done')
+          if (analysisStartRef.current != null) {
+            setLastRunDurationSec(
+              Math.floor((Date.now() - analysisStartRef.current) / 1000),
+            )
+          }
+          appendLog('Analysis complete.')
+          break
+        }
+        case 'error': {
+          const errText = typeof msg.data === 'string' ? msg.data : String(msg.data)
+          appendLog(`Error: ${errText}`)
+          setSessionError(errText)
+          setPhase('failed')
+          break
+        }
+        case 'chat_response':
+          setChatMessages((prev) => [
+            ...prev,
+            { role: 'advisor', text: typeof msg.data === 'string' ? msg.data : String(msg.data) },
+          ])
+          break
+        default:
+          break
+      }
+    },
+    [appendLog],
+  )
+
+  const ensureAnalyzeSocket = useCallback((): WebSocket | null => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      return wsRef.current
+    }
+    if (wsRef.current?.readyState === WebSocket.CONNECTING) {
+      return wsRef.current
+    }
+
+    const ws = new WebSocket(getAnalyzeWebSocketUrl())
+    wsRef.current = ws
 
     ws.onopen = () => {
-      setLiveConnecting(false)
-      setLiveConnected(true)
-      setLiveError(null)
+      setWsConnected(true)
+      setSessionError(null)
     }
 
     ws.onmessage = (event) => {
       try {
-        const payload = JSON.parse(event.data) as {
-          type?: string
-          ticker?: string
-          price?: number
-          change_pct?: number
-          ts?: number
-          detail?: string
-        }
-
-        if (payload.type === 'error') {
-          setLiveError(payload.detail ?? 'Live stream error')
-          return
-        }
-
-        if (payload.type !== 'quote_update') return
-
-        setData((prev) => {
-          if (!prev || !payload.ticker || prev.ticker !== payload.ticker) {
-            return prev
-          }
-
-          const nextPrice = typeof payload.price === 'number' ? payload.price : prev.price
-          const nextDayChange =
-            typeof payload.change_pct === 'number' ? payload.change_pct : prev.changes_pct.day
-
-          return {
-            ...prev,
-            price: nextPrice,
-            changes_pct: { ...prev.changes_pct, day: nextDayChange },
-          }
-        })
-
-        if (typeof payload.ts === 'number') {
-          setLastLiveTs(payload.ts)
-        }
+        const parsed = JSON.parse(event.data) as unknown
+        handleServerMessage(parsed)
       } catch {
-        // Ignore malformed live packets
+        appendLog(`(non-JSON message) ${event.data}`)
       }
     }
 
     ws.onerror = () => {
-      setLiveConnecting(false)
-      setLiveConnected(false)
-      setLiveError('Live connection failed')
+      setSessionError('WebSocket connection error. Is the backend running on port 8000?')
+      setPhase('failed')
+      setWsConnected(false)
     }
 
     ws.onclose = () => {
-      setLiveConnecting(false)
-      setLiveConnected(false)
+      setWsConnected(false)
+      if (wsRef.current === ws) {
+        wsRef.current = null
+      }
     }
 
-    return () => {
-      ws.close()
+    return ws
+  }, [appendLog, handleServerMessage])
+
+  const sendStart = useCallback(() => {
+    const sym = ticker.trim().toUpperCase()
+    if (!sym) return
+
+    setSessionError(null)
+    setReport(null)
+    setReportRaw(null)
+    setDraft(null)
+    analysisStartRef.current = Date.now()
+    setElapsedSec(0)
+    setLastRunDurationSec(null)
+    setActivityEntries([])
+    setCrewDeliverables([])
+    setChatMessages([])
+    setPhase('running')
+
+    const ws = ensureAnalyzeSocket()
+    if (!ws) return
+
+    const payload = {
+      action: 'start' as const,
+      ticker: sym,
+      query: focusQuery.trim(),
     }
-  }, [data?.ticker])
 
-  const showMenu = menuOpen && (displayRows.length > 0 || searchInFlight)
-
-  function onInputFocus() {
-    if (blurCloseTimer.current) {
-      clearTimeout(blurCloseTimer.current)
-      blurCloseTimer.current = null
-    }
-    setMenuOpen(true)
-  }
-
-  function onInputBlur() {
-    blurCloseTimer.current = setTimeout(() => {
-      setMenuOpen(false)
-      setHighlightIndex(-1)
-    }, 120)
-  }
-
-  function onInputKeyDown(e: KeyboardEvent<HTMLInputElement>) {
-    if (e.key === 'Escape') {
-      setMenuOpen(false)
-      setHighlightIndex(-1)
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(payload))
       return
     }
 
-    if (!showMenu && e.key === 'ArrowDown' && displayRows.length > 0) {
-      e.preventDefault()
-      setMenuOpen(true)
-      setHighlightIndex(0)
+    ws.addEventListener(
+      'open',
+      () => {
+        ws.send(JSON.stringify(payload))
+      },
+      { once: true },
+    )
+  }, [ensureAnalyzeSocket, focusQuery, ticker])
+
+  const sendFeedback = useCallback(() => {
+    const ws = wsRef.current
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setSessionError('Not connected. Start analysis again.')
+      return
+    }
+    const message = feedback.trim() || 'Looks good, proceed with the draft as-is.'
+    ws.send(JSON.stringify({ action: 'feedback', message }))
+    setPhase('running')
+    setDraft(null)
+    appendLog('Feedback sent. Agents are revising the report…')
+  }, [appendLog, feedback])
+
+  const sendChat = useCallback(() => {
+    const q = chatQuestion.trim()
+    if (!q) return
+    const ws = wsRef.current
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setSessionError('Not connected. Run a new analysis to chat.')
       return
     }
 
-    if (!showMenu) return
+    const context: Record<string, unknown> = report
+      ? { ...report }
+      : reportRaw
+        ? { ticker: ticker.trim().toUpperCase(), raw_report: reportRaw }
+        : { ticker: ticker.trim().toUpperCase() }
 
-    if (e.key === 'ArrowDown') {
-      e.preventDefault()
-      setHighlightIndex((i) =>
-        displayRows.length ? Math.min(i + 1, displayRows.length - 1) : -1,
-      )
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault()
-      setHighlightIndex((i) => Math.max(i - 1, 0))
-    } else if (e.key === 'Enter' && highlightIndex >= 0 && displayRows[highlightIndex]) {
-      e.preventDefault()
-      pickRow(displayRows[highlightIndex].symbol)
-    }
-  }
+    ws.send(JSON.stringify({ action: 'chat', question: q, context }))
+    setChatMessages((prev) => [...prev, { role: 'user', text: q }])
+    setChatQuestion('')
+    appendLog(`Chat: ${q}`)
+  }, [appendLog, chatQuestion, report, reportRaw, ticker])
 
-  async function onSubmit(e: FormEvent) {
+  function onStartSubmit(e: FormEvent) {
     e.preventDefault()
-    await fetchQuote(query)
+    sendStart()
   }
 
   return (
     <div className="min-h-svh bg-zinc-50 text-zinc-900 antialiased dark:bg-zinc-950 dark:text-zinc-100">
-      <div className="mx-auto flex max-w-3xl flex-col gap-10 px-4 py-12 sm:px-6">
-        <header className="text-center sm:text-left">
-          <p className="text-sm font-medium tracking-wide text-violet-600 dark:text-violet-400">
-            Market behavior
-          </p>
-          <h1 className="mt-1 font-semibold tracking-tight text-3xl text-zinc-900 sm:text-4xl dark:text-white">
-            Stock snapshot
-          </h1>
-          <p className="mt-2 max-w-xl text-sm leading-relaxed text-zinc-600 dark:text-zinc-400">
-            Choose a suggestion or press Enter — the quote loads as soon as a ticker is selected.
-          </p>
-        </header>
-
-        <form onSubmit={onSubmit} className="flex flex-col gap-3">
-          <div className="flex flex-1 flex-col gap-1.5 text-left">
-            <span className="text-xs font-medium uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
-              Ticker
-            </span>
-            <div className="relative">
-              <input
-                ref={inputRef}
-                type="text"
-                role="combobox"
-                aria-expanded={showMenu}
-                aria-controls={listId}
-                aria-autocomplete="list"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                onFocus={onInputFocus}
-                onBlur={onInputBlur}
-                onKeyDown={onInputKeyDown}
-                placeholder="Company name or symbol (e.g. NVIDIA or NVDA)…"
-                autoComplete="off"
-                spellCheck={false}
-                disabled={loading}
-                aria-busy={loading || searchInFlight}
-                className={`w-full rounded-xl border border-zinc-200 bg-white py-3 text-base font-medium outline-none ring-violet-500/0 transition placeholder:text-zinc-400 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 disabled:cursor-not-allowed disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-900 dark:focus:border-violet-400 ${
-                  trimmed && searchInFlight ? 'pl-4 pr-12' : 'px-4'
-                }`}
-              />
-              {trimmed && searchInFlight && (
-                <div className="pointer-events-none absolute right-3 top-1/2 flex -translate-y-1/2 items-center gap-2">
-                  <SearchSpinner />
-                  <span className="sr-only">Searching for matches</span>
-                </div>
-              )}
-              {showMenu && (
-                <ul
-                  id={listId}
-                  role="listbox"
-                  aria-busy={searchInFlight}
-                  className="absolute left-0 right-0 top-full z-20 mt-1 max-h-72 overflow-auto rounded-xl border border-zinc-200 bg-white py-1 shadow-lg shadow-zinc-900/10 dark:border-zinc-700 dark:bg-zinc-900 dark:shadow-none"
+      <div className="mx-auto flex max-w-3xl flex-col gap-8 px-4 py-10 sm:px-6">
+        <section className="overflow-hidden rounded-3xl border border-zinc-200/90 bg-white shadow-[0_20px_50px_-12px_rgba(109,40,217,0.12)] ring-1 ring-violet-500/5 dark:border-zinc-800 dark:bg-zinc-900 dark:shadow-[0_20px_50px_-12px_rgba(0,0,0,0.45)] dark:ring-violet-500/10">
+          <div className="relative border-b border-zinc-100 bg-linear-to-br from-violet-500/[0.07] via-white to-fuchsia-500/4 px-5 py-5 sm:px-6 dark:border-zinc-800 dark:from-violet-500/10 dark:via-zinc-900 dark:to-fuchsia-500/5">
+            <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+              <div className="flex gap-4">
+                <div
+                  className="flex size-11 shrink-0 items-center justify-center rounded-2xl bg-violet-600/10 text-violet-700 shadow-inner shadow-violet-900/5 dark:bg-violet-500/15 dark:text-violet-300"
+                  aria-hidden
                 >
-                  {searchInFlight && trimmed && (
-                    <li className="flex items-center gap-2 border-b border-zinc-100 px-4 py-2.5 text-sm text-zinc-600 dark:border-zinc-800 dark:text-zinc-400">
-                      <SearchSpinner className="size-3.5" />
-                      {debouncingSearch ? 'Finding matches…' : 'Searching…'}
-                    </li>
-                  )}
-                  {displayRows.map((row, idx) => (
-                    <li
-                      key={`${row.symbol}-${row.meta ?? ''}-${idx}`}
-                      role="option"
-                      aria-selected={idx === highlightIndex}
+                  <svg className="size-5" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0A17.933 17.933 0 0112 21.75c-2.676 0-5.216-.584-7.499-1.632z"
+                    />
+                  </svg>
+                </div>
+                <div>
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-violet-600 dark:text-violet-400">
+                    Knowledge base
+                  </p>
+                  <h2 className="mt-0.5 text-lg font-semibold tracking-tight text-zinc-900 dark:text-white">
+                    Investment profile
+                  </h2>
+                  <p className="mt-1.5 max-w-lg text-sm leading-relaxed text-zinc-600 dark:text-zinc-400">
+                    Shapes how the advisor interprets risk and writes reports. Updates{' '}
+                    <code className="rounded-md border border-zinc-200 bg-white/80 px-1.5 py-0.5 font-mono text-[11px] text-zinc-700 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-300">
+                      user_preference.txt
+                    </code>{' '}
+                    for RAG.
+                  </p>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 sm:justify-end">
+                {prefsLoading ? (
+                  <span className="inline-flex items-center gap-2 rounded-full border border-violet-200/80 bg-white/90 px-3 py-1.5 text-xs font-medium text-violet-800 shadow-sm dark:border-violet-500/20 dark:bg-zinc-950/80 dark:text-violet-200">
+                    <span className="relative flex size-2">
+                      <span className="absolute inline-flex size-full animate-ping rounded-full bg-violet-400 opacity-60" />
+                      <span className="relative inline-flex size-2 rounded-full bg-violet-500" />
+                    </span>
+                    Syncing…
+                  </span>
+                ) : prefsReady ? (
+                  <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-200/90 bg-emerald-50/90 px-3 py-1.5 text-xs font-semibold text-emerald-900 shadow-sm dark:border-emerald-500/25 dark:bg-emerald-950/50 dark:text-emerald-200">
+                    <span className="size-1.5 rounded-full bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.7)]" />
+                    In sync
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-200/90 bg-amber-50/90 px-3 py-1.5 text-xs font-semibold text-amber-950 shadow-sm dark:border-amber-500/25 dark:bg-amber-950/40 dark:text-amber-100">
+                    Offline
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={() => void loadPreferences()}
+                  disabled={prefsLoading}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-zinc-200/90 bg-white/90 px-3 py-2 text-xs font-semibold text-zinc-700 shadow-sm transition hover:border-violet-300 hover:bg-violet-50/50 hover:text-violet-900 disabled:pointer-events-none disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-950/80 dark:text-zinc-200 dark:hover:border-violet-500/30 dark:hover:bg-violet-950/30 dark:hover:text-violet-100"
+                >
+                  <svg className="size-3.5 shrink-0 opacity-70" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99"
+                    />
+                  </svg>
+                  Reload
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-4 px-5 py-5 sm:px-6">
+            {prefsError && (
+              <div
+                role="alert"
+                className="flex gap-3 rounded-2xl border border-rose-200/90 bg-rose-50/95 px-4 py-3 text-sm text-rose-900 dark:border-rose-900/50 dark:bg-rose-950/50 dark:text-rose-100"
+              >
+                <span className="text-rose-500 dark:text-rose-400" aria-hidden>
+                  <svg className="size-5 shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={1.75} stroke="currentColor">
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"
+                    />
+                  </svg>
+                </span>
+                <span>{prefsError}</span>
+              </div>
+            )}
+            {prefsSavedMsg && (
+              <div className="flex gap-3 rounded-2xl border border-emerald-200/90 bg-emerald-50/95 px-4 py-3 text-sm font-medium text-emerald-950 dark:border-emerald-800/50 dark:bg-emerald-950/40 dark:text-emerald-100">
+                <span className="text-emerald-600 dark:text-emerald-400" aria-hidden>
+                  <svg className="size-5 shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={1.75} stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+                  </svg>
+                </span>
+                <span>{prefsSavedMsg}</span>
+              </div>
+            )}
+            {prefsRawPreview && !prefsLoading && (
+              <p className="rounded-xl border border-amber-200/70 bg-amber-50/50 px-3 py-2 text-xs text-amber-950 dark:border-amber-900/40 dark:bg-amber-950/25 dark:text-amber-100/90">
+                This file uses a non-standard layout. Raw content is shown below the form.
+              </p>
+            )}
+
+            <form onSubmit={savePreferences} className="space-y-5">
+              <div className="rounded-2xl border border-zinc-100 bg-zinc-50/50 p-4 dark:border-zinc-800/80 dark:bg-zinc-950/40">
+                <p className="mb-3 flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-zinc-500 dark:text-zinc-400">
+                  <span className="h-px flex-1 bg-linear-to-r from-transparent via-zinc-300 to-transparent dark:via-zinc-600" />
+                  Risk &amp; time horizon
+                  <span className="h-px flex-1 bg-linear-to-r from-transparent via-zinc-300 to-transparent dark:via-zinc-600" />
+                </p>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <div className="group flex flex-col gap-1.5">
+                    <label
+                      htmlFor="risk-tolerance"
+                      className="text-xs font-semibold text-zinc-700 dark:text-zinc-300"
                     >
-                      <button
-                        type="button"
-                        className={`flex w-full flex-col items-start gap-0.5 px-4 py-2.5 text-left text-sm transition hover:bg-violet-50 dark:hover:bg-violet-950/40 ${
-                          idx === highlightIndex
-                            ? 'bg-violet-100 dark:bg-violet-950/60'
-                            : ''
-                        }`}
-                        onMouseDown={(e) => e.preventDefault()}
-                        onClick={() => pickRow(row.symbol)}
-                      >
-                        <span className="font-semibold tabular-nums text-zinc-900 dark:text-zinc-100">
-                          {row.symbol}
-                        </span>
-                        <span className="line-clamp-2 text-xs text-zinc-600 dark:text-zinc-400">
-                          {row.name}
-                        </span>
-                        {row.meta && (
-                          <span className="text-[11px] font-medium uppercase tracking-wide text-zinc-400 dark:text-zinc-500">
-                            {row.meta}
-                          </span>
+                      Risk tolerance
+                    </label>
+                    <p className="text-[11px] leading-snug text-zinc-500 dark:text-zinc-500">
+                      Band used across the crew for positioning language.
+                    </p>
+                    <select
+                      id="risk-tolerance"
+                      value={riskTolerance}
+                      onChange={(e) => setRiskTolerance(e.target.value)}
+                      disabled={prefsLoading}
+                      className="mt-0.5 w-full cursor-pointer appearance-none rounded-xl border border-zinc-200 bg-white py-2.5 pl-3 pr-9 text-sm text-zinc-900 shadow-sm outline-none transition focus:border-violet-500 focus:ring-2 focus:ring-violet-500/25 disabled:cursor-not-allowed disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:focus:border-violet-400"
+                      style={{
+                        backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%2371717a'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M19 9l-7 7-7-7'%3E%3C/path%3E%3C/svg%3E")`,
+                        backgroundRepeat: 'no-repeat',
+                        backgroundPosition: 'right 0.65rem center',
+                        backgroundSize: '1rem',
+                      }}
+                    >
+                      <option value="">Choose a profile…</option>
+                      {RISK_TOLERANCE_PRESETS.map((opt) => (
+                        <option key={opt} value={opt}>
+                          {opt}
+                        </option>
+                      ))}
+                      {riskTolerance &&
+                        !(RISK_TOLERANCE_PRESETS as readonly string[]).includes(riskTolerance) && (
+                          <option value={riskTolerance}>
+                            {riskTolerance} (from saved profile)
+                          </option>
                         )}
-                      </button>
-                    </li>
-                  ))}
-                </ul>
+                    </select>
+                  </div>
+                  <div className="relative flex flex-col gap-1.5">
+                    <label
+                      htmlFor="investment-horizon"
+                      className="text-xs font-semibold text-zinc-700 dark:text-zinc-300"
+                    >
+                      Investment horizon
+                    </label>
+                    <p className="text-[11px] leading-snug text-zinc-500 dark:text-zinc-500">
+                      Pick a preset or type freely — both are saved.
+                    </p>
+                    <input
+                      id="investment-horizon"
+                      type="text"
+                      role="combobox"
+                      aria-expanded={horizonMenuOpen}
+                      aria-controls={horizonListId}
+                      aria-autocomplete="list"
+                      value={investmentHorizon}
+                      onChange={(e) => {
+                        setInvestmentHorizon(e.target.value)
+                        setHorizonHighlight(-1)
+                        openHorizonMenu()
+                      }}
+                      onFocus={openHorizonMenu}
+                      onBlur={closeHorizonMenuSoon}
+                      onKeyDown={onHorizonKeyDown}
+                      placeholder="e.g. 3–5 years or start typing…"
+                      autoComplete="off"
+                      disabled={prefsLoading}
+                      className="mt-0.5 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2.5 text-sm text-zinc-900 shadow-sm outline-none transition placeholder:text-zinc-400 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/25 disabled:cursor-not-allowed disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-500"
+                    />
+                    {horizonMenuOpen && !prefsLoading && (
+                      <ul
+                        id={horizonListId}
+                        role="listbox"
+                        className="absolute left-0 right-0 top-full z-30 mt-1 max-h-52 overflow-auto rounded-xl border border-zinc-200/90 bg-white py-1 shadow-xl shadow-zinc-900/10 ring-1 ring-black/5 dark:border-zinc-600 dark:bg-zinc-900 dark:shadow-black/30 dark:ring-white/5"
+                      >
+                        {horizonSuggestions.length === 0 ? (
+                          <li className="px-3 py-3 text-xs leading-relaxed text-zinc-500 dark:text-zinc-400">
+                            No preset matches — your text will still be saved.
+                          </li>
+                        ) : (
+                          horizonSuggestions.map((opt, idx) => (
+                            <li key={opt} role="option" aria-selected={idx === horizonHighlight}>
+                              <button
+                                type="button"
+                                className={`flex w-full px-3 py-2.5 text-left text-sm text-zinc-800 transition hover:bg-violet-50 dark:text-zinc-100 dark:hover:bg-violet-950/50 ${
+                                  idx === horizonHighlight
+                                    ? 'bg-violet-100 dark:bg-violet-950/70'
+                                    : ''
+                                }`}
+                                onMouseDown={(ev) => ev.preventDefault()}
+                                onClick={() => pickHorizonSuggestion(opt)}
+                              >
+                                {opt}
+                              </button>
+                            </li>
+                          ))
+                        )}
+                      </ul>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-zinc-100 bg-zinc-50/50 p-4 dark:border-zinc-800/80 dark:bg-zinc-950/40">
+                <p className="mb-3 flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-zinc-500 dark:text-zinc-400">
+                  <span className="h-px flex-1 bg-linear-to-r from-transparent via-zinc-300 to-transparent dark:via-zinc-600" />
+                  Voice &amp; constraints
+                  <span className="h-px flex-1 bg-linear-to-r from-transparent via-zinc-300 to-transparent dark:via-zinc-600" />
+                </p>
+                <div className="flex flex-col gap-1.5">
+                  <label
+                    htmlFor="style-preferences"
+                    className="text-xs font-semibold text-zinc-700 dark:text-zinc-300"
+                  >
+                    Style &amp; extra preferences
+                  </label>
+                  <p className="text-[11px] leading-snug text-zinc-500 dark:text-zinc-500">
+                    Tone, sectors, length, or anything the advisor should respect.
+                  </p>
+                  <textarea
+                    id="style-preferences"
+                    value={preferencesExtra}
+                    onChange={(e) => setPreferencesExtra(e.target.value)}
+                    placeholder="e.g. Keep bullets short; avoid hype; prefer dividend names…"
+                    rows={4}
+                    disabled={prefsLoading}
+                    className="mt-0.5 min-h-22 w-full resize-y rounded-xl border border-zinc-200 bg-white px-3 py-2.5 text-sm text-zinc-900 shadow-sm outline-none transition placeholder:text-zinc-400 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/25 disabled:cursor-not-allowed disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-500"
+                  />
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-3 border-t border-zinc-100 pt-4 dark:border-zinc-800 sm:flex-row sm:items-center sm:justify-between">
+                <p className="text-[11px] leading-relaxed text-zinc-500 dark:text-zinc-500">
+                  Changes apply on the next analysis. The knowledge task reads this file via RAG.
+                </p>
+                <button
+                  type="submit"
+                  disabled={prefsLoading || prefsSaving}
+                  className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-linear-to-r from-violet-600 to-fuchsia-600 px-5 py-2.5 text-sm font-semibold text-white shadow-md shadow-violet-500/25 transition hover:from-violet-500 hover:to-fuchsia-500 hover:shadow-lg hover:shadow-violet-500/20 disabled:cursor-not-allowed disabled:opacity-50 disabled:shadow-none sm:w-auto dark:shadow-violet-900/30"
+                >
+                  {prefsSaving ? (
+                    <SearchSpinner className="size-4 border-white border-t-transparent" />
+                  ) : (
+                    <svg className="size-4" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        d="M4.5 12.75l6 6 9-13.5"
+                      />
+                    </svg>
+                  )}
+                  Save to knowledge base
+                </button>
+              </div>
+            </form>
+
+            {prefsRawPreview && (
+              <details className="group rounded-2xl border border-zinc-200 bg-zinc-50/80 dark:border-zinc-800 dark:bg-zinc-950/60">
+                <summary className="cursor-pointer list-none px-4 py-3 text-xs font-semibold text-zinc-600 marker:hidden dark:text-zinc-400 [&::-webkit-details-marker]:hidden">
+                  <span className="flex items-center justify-between gap-2">
+                    Raw file preview
+                    <span className="text-[10px] font-normal text-zinc-400 group-open:hidden dark:text-zinc-500">
+                      Show
+                    </span>
+                    <span className="hidden text-[10px] font-normal text-zinc-400 group-open:inline dark:text-zinc-500">
+                      Hide
+                    </span>
+                  </span>
+                </summary>
+                <pre className="max-h-48 overflow-auto border-t border-zinc-200 p-4 font-mono text-[11px] leading-relaxed text-zinc-700 dark:border-zinc-800 dark:text-zinc-300">
+                  {prefsRawPreview}
+                </pre>
+              </details>
+            )}
+          </div>
+        </section>
+
+        <section className="overflow-hidden rounded-3xl border border-zinc-200/90 bg-white shadow-[0_20px_50px_-12px_rgba(109,40,217,0.1)] ring-1 ring-violet-500/5 dark:border-zinc-800 dark:bg-zinc-900 dark:shadow-[0_20px_50px_-12px_rgba(0,0,0,0.4)] dark:ring-violet-500/10">
+          <div className="relative border-b border-zinc-100 bg-linear-to-br from-violet-600/10 via-white to-fuchsia-500/5 px-5 py-6 sm:px-6 dark:border-zinc-800 dark:from-violet-500/15 dark:via-zinc-900 dark:to-fuchsia-500/8">
+            <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
+              <div className="flex gap-4">
+                <div
+                  className="flex size-12 shrink-0 items-center justify-center rounded-2xl bg-linear-to-br from-violet-600 to-fuchsia-600 text-white shadow-lg shadow-violet-500/30"
+                  aria-hidden
+                >
+                  <svg className="size-6" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M3.75 3v11.25A2.25 2.25 0 006 16.5h2.25M3.75 3h-1.5m1.5 0h16.5m0 0h1.5m-1.5 0v11.25A2.25 2.25 0 0118 16.5h-2.25m-7.5 0h7.5m-7.5 0l-1 3m8.5-3l1 3m0 0l.5 1.5m-.5-1.5h-9.5m0 0l-.5 1.5M9 11.25v1.5M12 9v3.75m3-6v6"
+                    />
+                  </svg>
+                </div>
+                <div>
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-violet-600 dark:text-violet-400">
+                    CrewAI · Human in the loop
+                  </p>
+                  <h1 className="mt-1 text-2xl font-semibold tracking-tight text-zinc-900 sm:text-3xl dark:text-white">
+                    Agentic stock analyst
+                  </h1>
+                  <p className="mt-2 max-w-xl text-sm leading-relaxed text-zinc-600 dark:text-zinc-400">
+                    Multi-agent research, a review pause for your feedback, then structured JSON — with a live trace of
+                    what the crew is doing.
+                  </p>
+                  <ol className="mt-3 list-decimal space-y-1 pl-5 text-xs leading-relaxed text-zinc-500 dark:text-zinc-500">
+                    <li>Set ticker and optional focus, then run.</li>
+                    <li>Review the draft and send feedback (or approve).</li>
+                    <li>Chat with the advisor after the report is ready.</li>
+                  </ol>
+                </div>
+              </div>
+              <div className="flex flex-col gap-2 rounded-2xl border border-white/60 bg-white/70 px-4 py-3 shadow-sm dark:border-zinc-700/80 dark:bg-zinc-950/60">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-[10px] font-bold uppercase tracking-widest text-zinc-500 dark:text-zinc-400">
+                    Session
+                  </span>
+                  <span
+                    className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${
+                      phase === 'running'
+                        ? 'bg-violet-500/20 text-violet-800 dark:bg-violet-500/25 dark:text-violet-200'
+                        : phase === 'awaiting_feedback'
+                          ? 'bg-amber-500/20 text-amber-900 dark:bg-amber-500/20 dark:text-amber-100'
+                          : phase === 'done'
+                            ? 'bg-emerald-500/20 text-emerald-900 dark:bg-emerald-500/20 dark:text-emerald-100'
+                            : phase === 'failed'
+                              ? 'bg-rose-500/20 text-rose-900 dark:bg-rose-500/20 dark:text-rose-100'
+                              : 'bg-zinc-200/80 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300'
+                    }`}
+                  >
+                    {analysisPhaseLabel(phase)}
+                  </span>
+                </div>
+                <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-600 dark:text-zinc-400">
+                  {wsConnected ? (
+                    <span className="inline-flex items-center gap-1.5 font-medium text-emerald-700 dark:text-emerald-400">
+                      <span className="relative flex size-2">
+                        <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-400 opacity-40" />
+                        <span className="relative size-2 rounded-full bg-emerald-500" />
+                      </span>
+                      Live channel
+                    </span>
+                  ) : phase === 'running' || phase === 'awaiting_feedback' ? (
+                    <span className="inline-flex items-center gap-1.5 text-amber-700 dark:text-amber-300">
+                      <SearchSpinner className="size-3 border-amber-600 border-t-transparent dark:border-amber-400" />
+                      Connecting…
+                    </span>
+                  ) : (
+                    <span className="text-zinc-500">Channel idle</span>
+                  )}
+                  {(phase === 'running' || phase === 'awaiting_feedback') && (
+                    <span className="tabular-nums text-violet-700 dark:text-violet-300">
+                      Elapsed {formatDuration(elapsedSec)}
+                    </span>
+                  )}
+                  {phase === 'done' && lastRunDurationSec != null && (
+                    <span className="tabular-nums text-zinc-500">
+                      Finished in {formatDuration(lastRunDurationSec)}
+                    </span>
+                  )}
+                </div>
+                {(phase === 'running' || phase === 'awaiting_feedback') && (
+                  <div
+                    className="h-1.5 overflow-hidden rounded-full bg-zinc-200/90 dark:bg-zinc-800"
+                    aria-hidden
+                  >
+                    <div className="h-full w-3/5 animate-pulse rounded-full bg-linear-to-r from-violet-500 to-fuchsia-500" />
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-5 px-5 py-5 sm:px-6">
+            <form onSubmit={onStartSubmit} className="space-y-4">
+              <div className="rounded-2xl border border-zinc-100 bg-zinc-50/50 p-4 dark:border-zinc-800/80 dark:bg-zinc-950/40">
+                <p className="mb-3 text-[11px] font-bold uppercase tracking-widest text-zinc-500 dark:text-zinc-400">
+                  Run configuration
+                </p>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <div className="flex flex-col gap-1.5 sm:col-span-1">
+                    <label
+                      htmlFor="analysis-ticker"
+                      className="text-xs font-semibold text-zinc-700 dark:text-zinc-300"
+                    >
+                      Ticker
+                    </label>
+                    <input
+                      id="analysis-ticker"
+                      type="text"
+                      value={ticker}
+                      onChange={(e) => setTicker(e.target.value.toUpperCase())}
+                      placeholder="e.g. TSLA"
+                      disabled={phase === 'running' || phase === 'awaiting_feedback'}
+                      className="w-full rounded-xl border border-zinc-200 bg-white px-3 py-2.5 text-base font-semibold tabular-nums tracking-wide outline-none transition focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-900 dark:text-white"
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1.5 sm:col-span-2">
+                    <label
+                      htmlFor="analysis-focus"
+                      className="text-xs font-semibold text-zinc-700 dark:text-zinc-300"
+                    >
+                      Research focus{' '}
+                      <span className="font-normal text-zinc-500">(optional)</span>
+                    </label>
+                    <textarea
+                      id="analysis-focus"
+                      value={focusQuery}
+                      onChange={(e) => setFocusQuery(e.target.value)}
+                      placeholder="What should the crew emphasize? Catalysts, valuation, risks, comparables…"
+                      rows={3}
+                      disabled={phase === 'running' || phase === 'awaiting_feedback'}
+                      className="w-full resize-y rounded-xl border border-zinc-200 bg-white px-3 py-2.5 text-sm outline-none transition focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+                    />
+                  </div>
+                </div>
+                <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center">
+                  <button
+                    type="submit"
+                    disabled={!ticker.trim() || phase === 'running' || phase === 'awaiting_feedback'}
+                    className="inline-flex flex-1 items-center justify-center gap-2 rounded-xl bg-linear-to-r from-violet-600 to-fuchsia-600 px-5 py-2.5 text-sm font-semibold text-white shadow-md shadow-violet-500/25 transition hover:from-violet-500 hover:to-fuchsia-500 disabled:cursor-not-allowed disabled:opacity-50 disabled:shadow-none sm:flex-none dark:shadow-violet-900/30"
+                  >
+                    {(phase === 'running' || phase === 'awaiting_feedback') && (
+                      <SearchSpinner className="size-4 border-white border-t-transparent" />
+                    )}
+                    {phase === 'running'
+                      ? 'Analysis in progress…'
+                      : phase === 'awaiting_feedback'
+                        ? 'Waiting for your review…'
+                        : 'Run analysis'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={resetSession}
+                    className="rounded-xl border border-zinc-200 bg-white px-4 py-2.5 text-sm font-semibold text-zinc-700 shadow-sm transition hover:border-violet-300 hover:bg-violet-50/40 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:border-violet-500/30"
+                  >
+                    New session
+                  </button>
+                </div>
+              </div>
+            </form>
+
+            {sessionError && (
+              <div
+                role="alert"
+                className="flex gap-3 rounded-2xl border border-rose-200/90 bg-rose-50/95 px-4 py-3 text-sm text-rose-900 dark:border-rose-900/50 dark:bg-rose-950/50 dark:text-rose-100"
+              >
+                <svg className="size-5 shrink-0 text-rose-500" fill="none" viewBox="0 0 24 24" strokeWidth={1.75} stroke="currentColor">
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"
+                  />
+                </svg>
+                <span>{sessionError}</span>
+              </div>
+            )}
+
+            {(activityEntries.length > 0 ||
+              crewDeliverables.length > 0 ||
+              phase === 'running' ||
+              phase === 'awaiting_feedback') && (
+              <div className="overflow-hidden rounded-2xl border border-zinc-200/90 bg-linear-to-b from-violet-50/35 via-zinc-50/30 to-zinc-50/40 dark:border-zinc-800 dark:from-violet-950/20 dark:via-zinc-950/40 dark:to-zinc-950/50">
+                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-200/80 px-4 py-3 dark:border-zinc-800">
+                  <div>
+                    <h2 className="text-xs font-bold uppercase tracking-widest text-violet-800 dark:text-violet-300">
+                      Agents activities
+                    </h2>
+                    <p className="mt-0.5 max-w-xl text-[11px] leading-relaxed text-zinc-600 dark:text-zinc-400">
+                      Live status from the crew and completed task outputs as they finish — all on one feed.
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {(phase === 'running' || phase === 'awaiting_feedback') && (
+                      <span className="inline-flex items-center gap-1.5 text-[11px] font-medium text-violet-600 dark:text-violet-400">
+                        <span className="size-1.5 animate-pulse rounded-full bg-violet-500" />
+                        Live
+                      </span>
+                    )}
+                    <span className="rounded-full bg-zinc-200/80 px-2.5 py-0.5 text-[11px] font-semibold tabular-nums text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200">
+                      {activityEntries.length} update{activityEntries.length === 1 ? '' : 's'} ·{' '}
+                      {crewDeliverables.length} task{crewDeliverables.length === 1 ? '' : 's'}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="max-h-128 space-y-4 overflow-y-auto p-3 sm:max-h-144">
+                  <div>
+                    <p className="mb-2 px-1 text-[10px] font-bold uppercase tracking-wider text-zinc-500 dark:text-zinc-500">
+                      Status
+                    </p>
+                    {activityEntries.length === 0 &&
+                      (phase === 'running' || phase === 'awaiting_feedback') && (
+                        <p className="px-2 py-4 text-center text-sm text-zinc-500 dark:text-zinc-400">
+                          <span className="inline-flex items-center gap-2">
+                            <SearchSpinner className="size-4" />
+                            Waiting for the first status…
+                          </span>
+                        </p>
+                      )}
+                    <ul className="space-y-1">
+                      {activityEntries.map((entry, i) => {
+                        const isLatest = i === activityEntries.length - 1
+                        const livePulse =
+                          isLatest && (phase === 'running' || phase === 'awaiting_feedback')
+                        return (
+                          <li key={entry.id}>
+                            <div
+                              className={`flex gap-3 rounded-xl px-3 py-2.5 transition ${
+                                livePulse
+                                  ? 'bg-violet-50/90 ring-1 ring-violet-200/80 dark:bg-violet-950/40 dark:ring-violet-500/25'
+                                  : 'hover:bg-white/80 dark:hover:bg-zinc-900/60'
+                              }`}
+                            >
+                              <time
+                                className="shrink-0 tabular-nums text-[10px] font-medium text-zinc-400 dark:text-zinc-500"
+                                dateTime={new Date(entry.ts).toISOString()}
+                              >
+                                {new Date(entry.ts).toLocaleTimeString(undefined, {
+                                  hour: '2-digit',
+                                  minute: '2-digit',
+                                  second: '2-digit',
+                                })}
+                              </time>
+                              <p className="min-w-0 flex-1 text-sm leading-snug text-zinc-800 dark:text-zinc-200">
+                                {entry.message}
+                              </p>
+                              {livePulse && (
+                                <span
+                                  className="mt-0.5 size-2 shrink-0 rounded-full bg-violet-500 shadow-[0_0_8px_rgba(139,92,246,0.8)]"
+                                  aria-hidden
+                                />
+                              )}
+                            </div>
+                          </li>
+                        )
+                      })}
+                    </ul>
+                  </div>
+
+                  <div className="border-t border-zinc-200/70 pt-3 dark:border-zinc-800">
+                    <p className="mb-2 px-1 text-[10px] font-bold uppercase tracking-wider text-zinc-500 dark:text-zinc-500">
+                      Task outputs
+                    </p>
+                    {crewDeliverables.length === 0 &&
+                      (phase === 'running' || phase === 'awaiting_feedback') && (
+                        <p className="px-2 py-4 text-center text-sm text-zinc-500 dark:text-zinc-400">
+                          <span className="inline-flex items-center gap-2">
+                            <SearchSpinner className="size-4 text-violet-500" />
+                            Waiting for the first completed task…
+                          </span>
+                        </p>
+                      )}
+                    <div className="space-y-2">
+                      {crewDeliverables.map((d) => (
+                        <details
+                          key={d.id}
+                          className="group rounded-xl border border-zinc-200/90 bg-white/90 open:ring-2 open:ring-violet-400/30 dark:border-zinc-700 dark:bg-zinc-900/80 dark:open:ring-violet-500/25"
+                        >
+                          <summary className="flex cursor-pointer list-none flex-wrap items-center justify-between gap-2 px-3 py-2.5 marker:hidden [&::-webkit-details-marker]:hidden">
+                            <span className="min-w-0 font-semibold text-zinc-900 dark:text-white">
+                              {formatCrewTaskTitle(d.task_name)}
+                            </span>
+                            <span className="text-[10px] text-zinc-400 group-open:hidden dark:text-zinc-500">
+                              Tap to expand
+                            </span>
+                          </summary>
+                          <div className="border-t border-zinc-100 px-3 py-2 dark:border-zinc-800">
+                            {d.agent_role ? (
+                              <p className="mb-2 text-[11px] text-zinc-500 dark:text-zinc-400">
+                                {d.agent_role}
+                              </p>
+                            ) : null}
+                            {d.truncated && (
+                              <p className="mb-2 text-[11px] font-medium text-amber-700 dark:text-amber-400">
+                                Output was truncated for the browser; full text may be in server logs.
+                              </p>
+                            )}
+                            <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded-lg bg-zinc-50 p-3 font-mono text-[11px] leading-relaxed text-zinc-800 dark:bg-zinc-950 dark:text-zinc-200">
+                              {d.output}
+                            </pre>
+                            <time
+                              className="mt-2 block text-[10px] text-zinc-400 dark:text-zinc-500"
+                              dateTime={new Date(d.ts).toISOString()}
+                            >
+                              {new Date(d.ts).toLocaleTimeString(undefined, {
+                                hour: '2-digit',
+                                minute: '2-digit',
+                                second: '2-digit',
+                              })}
+                            </time>
+                          </div>
+                        </details>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div ref={agentsActivitiesEndRef} />
+                </div>
+              </div>
+            )}
+          </div>
+        </section>
+
+        {draft !== null && phase === 'awaiting_feedback' && (
+          <section className="flex flex-col gap-4 overflow-hidden rounded-3xl border border-amber-200/80 bg-linear-to-br from-amber-50/90 to-white p-6 shadow-lg shadow-amber-900/5 dark:border-amber-900/45 dark:from-amber-950/35 dark:to-zinc-900 dark:shadow-none">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h2 className="text-base font-semibold text-amber-950 dark:text-amber-100">
+                Your review
+              </h2>
+              <span className="rounded-full bg-amber-500/20 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-amber-900 dark:bg-amber-500/15 dark:text-amber-200">
+                Human in the loop
+              </span>
+            </div>
+            <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded-xl border border-amber-200/60 bg-white/80 p-4 text-sm text-zinc-800 dark:border-amber-900/30 dark:bg-zinc-950 dark:text-zinc-200">
+              {draft}
+            </pre>
+            <label className="text-xs font-medium uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
+              Your feedback
+            </label>
+            <textarea
+              value={feedback}
+              onChange={(e) => setFeedback(e.target.value)}
+              placeholder="e.g. Shorter bullets, expand risks, tone down hype…"
+              rows={4}
+              className="w-full resize-y rounded-xl border border-zinc-200 bg-white px-4 py-3 text-sm outline-none focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 dark:border-zinc-700 dark:bg-zinc-900"
+            />
+            <button
+              type="button"
+              onClick={sendFeedback}
+              className="self-start rounded-xl bg-amber-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-amber-500 dark:bg-amber-500 dark:hover:bg-amber-400"
+            >
+              Submit feedback
+            </button>
+          </section>
+        )}
+
+        {(report || reportRaw) && phase === 'done' && (
+          <section className="flex flex-col gap-4 overflow-hidden rounded-2xl border border-zinc-200 bg-white shadow-lg shadow-zinc-900/5 dark:border-zinc-800 dark:bg-zinc-900/80 dark:shadow-none">
+            <div className="border-b border-zinc-100 bg-linear-to-br from-violet-500/10 via-transparent to-transparent px-6 py-5 dark:border-zinc-800">
+              <h2 className="text-lg font-semibold text-zinc-900 dark:text-white">
+                Final report
+                {report && (
+                  <span className="ml-2 tabular-nums text-violet-600 dark:text-violet-400">
+                    {report.ticker}
+                  </span>
+                )}
+              </h2>
+              {report && (
+                <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+                  Confidence: {report.confidence_level} · Trend: {report.trend}
+                  {lastRunDurationSec != null && (
+                    <span className="text-zinc-500">
+                      {' '}
+                      · Run time {formatDuration(lastRunDurationSec)}
+                    </span>
+                  )}
+                </p>
               )}
             </div>
-          </div>
-        </form>
 
-        {error && (
-          <div
-            role="alert"
-            className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800 dark:border-rose-900/50 dark:bg-rose-950/40 dark:text-rose-200"
-          >
-            {error}
-          </div>
+            {report ? (
+              <div className="grid gap-4 px-6 pb-6">
+                <div className="rounded-xl border border-zinc-100 bg-zinc-50/80 p-4 dark:border-zinc-800 dark:bg-zinc-950/50">
+                  <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
+                    Market view
+                  </h3>
+                  <p className="mt-2 text-sm leading-relaxed text-zinc-800 dark:text-zinc-200">
+                    {report.market_view}
+                  </p>
+                </div>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <div className="rounded-xl border border-zinc-100 bg-zinc-50/80 p-4 dark:border-zinc-800 dark:bg-zinc-950/50">
+                    <h3 className="text-xs font-semibold uppercase tracking-wide text-emerald-700 dark:text-emerald-400">
+                      Bull case
+                    </h3>
+                    <p className="mt-2 text-sm leading-relaxed text-zinc-800 dark:text-zinc-200">
+                      {report.bull_case}
+                    </p>
+                  </div>
+                  <div className="rounded-xl border border-zinc-100 bg-zinc-50/80 p-4 dark:border-zinc-800 dark:bg-zinc-950/50">
+                    <h3 className="text-xs font-semibold uppercase tracking-wide text-rose-700 dark:text-rose-400">
+                      Bear case
+                    </h3>
+                    <p className="mt-2 text-sm leading-relaxed text-zinc-800 dark:text-zinc-200">
+                      {report.bear_case}
+                    </p>
+                  </div>
+                </div>
+                <div className="rounded-xl border border-zinc-100 bg-zinc-50/80 p-4 dark:border-zinc-800 dark:bg-zinc-950/50">
+                  <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
+                    Key catalysts
+                  </h3>
+                  <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-zinc-800 dark:text-zinc-200">
+                    {report.key_catalysts.map((c, i) => (
+                      <li key={i}>{c}</li>
+                    ))}
+                  </ul>
+                </div>
+                <div className="rounded-xl border border-zinc-100 bg-zinc-50/80 p-4 dark:border-zinc-800 dark:bg-zinc-950/50">
+                  <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
+                    Main risks
+                  </h3>
+                  <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-zinc-800 dark:text-zinc-200">
+                    {report.main_risks.map((r, i) => (
+                      <li key={i}>{r}</li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+            ) : (
+              <pre className="max-h-96 overflow-auto px-6 pb-6 text-xs text-zinc-700 dark:text-zinc-300">
+                {reportRaw}
+              </pre>
+            )}
+          </section>
         )}
 
-        {data && (
-          <div className="flex flex-col gap-6">
-            <div className="overflow-hidden rounded-2xl border border-zinc-200/80 bg-white shadow-lg shadow-zinc-900/5 dark:border-zinc-800 dark:bg-zinc-900/80 dark:shadow-none">
-              <div className="border-b border-zinc-100 bg-linear-to-br from-violet-500/10 via-transparent to-transparent px-6 py-6 dark:border-zinc-800 dark:from-violet-500/5">
-                <div className="flex flex-wrap items-end justify-between gap-4">
-                  <div>
-                    <p className="flex items-center gap-2 text-xs font-semibold uppercase tracking-widest text-zinc-500 dark:text-zinc-400">
-                      <span>{data.ticker}</span>
-                      {liveConnecting && (
-                        <span className="inline-flex items-center gap-1 rounded-full bg-zinc-100 px-2 py-0.5 text-[10px] text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
-                          <SearchSpinner className="size-2.5" />
-                          Connecting
-                        </span>
-                      )}
-                      {liveConnected && (
-                        <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] text-emerald-700 dark:text-emerald-300">
-                          <span className="size-1.5 rounded-full bg-emerald-500" />
-                          Live
-                        </span>
-                      )}
-                    </p>
-                    <p className="mt-1 flex items-baseline gap-2">
-                      <span className="text-4xl font-semibold tracking-tight tabular-nums sm:text-5xl">
-                        {data.price.toLocaleString(undefined, {
-                          minimumFractionDigits: 2,
-                          maximumFractionDigits: 2,
-                        })}
-                      </span>
-                      <span className="text-sm font-medium text-zinc-500 dark:text-zinc-400">
-                        {data.currency}
-                      </span>
-                    </p>
-                    <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-                      {liveError
-                        ? liveError
-                        : liveConnected
-                          ? `Streaming live${lastLiveTs ? ` · ${new Date(lastLiveTs * 1000).toLocaleTimeString()}` : ''}`
-                          : 'Live stream idle'}
-                    </p>
-                  </div>
-                  <div className="flex flex-wrap gap-2">
-                    <span
-                      className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold capitalize ring-1 ring-inset ${trendStyles(data.summary.trend)}`}
-                    >
-                      Trend: {data.summary.trend}
-                    </span>
-                    <span
-                      className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold capitalize ring-1 ring-inset ${momentumStyles(data.summary.momentum)}`}
-                    >
-                      Momentum: {data.summary.momentum}
-                    </span>
-                    <span
-                      className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ring-1 ring-inset ${
-                        data.summary.unusual_activity
-                          ? 'bg-amber-500/20 text-amber-900 ring-amber-500/40 dark:text-amber-200'
-                          : 'bg-zinc-100 text-zinc-600 ring-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:ring-zinc-700'
-                      }`}
-                    >
-                      Unusual volume: {data.summary.unusual_activity ? 'Yes' : 'No'}
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              <div className="grid gap-4 p-6 sm:grid-cols-3">
-                {(
-                  [
-                    { label: 'Day', value: data.changes_pct.day },
-                    { label: 'Week (~5d)', value: data.changes_pct.week },
-                    { label: 'Month (~21d)', value: data.changes_pct.month },
-                  ] as const
-                ).map(({ label, value }) => (
-                  <div
-                    key={label}
-                    className="rounded-xl border border-zinc-100 bg-zinc-50/80 px-4 py-3 dark:border-zinc-800 dark:bg-zinc-950/50"
-                  >
-                    <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400">{label}</p>
-                    <p className={`mt-1 text-2xl font-semibold tabular-nums ${pctColor(value)}`}>
-                      {formatPct(value)}
-                    </p>
-                  </div>
-                ))}
-              </div>
-
-              <div className="grid gap-4 border-t border-zinc-100 px-6 py-6 sm:grid-cols-2 dark:border-zinc-800">
-                <div className="rounded-xl border border-zinc-100 bg-zinc-50/50 px-4 py-3 dark:border-zinc-800 dark:bg-zinc-950/30">
-                  <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400">
-                    Volume vs 20-day avg
-                  </p>
-                  <p className="mt-1 text-xl font-semibold tabular-nums text-zinc-900 dark:text-zinc-100">
-                    {data.volume_vs_20d_avg != null
-                      ? `${data.volume_vs_20d_avg.toFixed(2)}×`
-                      : '—'}
-                  </p>
-                </div>
-                <div className="rounded-xl border border-zinc-100 bg-zinc-50/50 px-4 py-3 dark:border-zinc-800 dark:bg-zinc-950/30">
-                  <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400">Moving averages</p>
-                  <dl className="mt-2 space-y-1 text-sm">
-                    <div className="flex justify-between gap-4 tabular-nums">
-                      <dt className="text-zinc-500 dark:text-zinc-400">SMA 5</dt>
-                      <dd className="font-medium">
-                        {data.indicators.sma_5 != null
-                          ? data.indicators.sma_5.toLocaleString(undefined, {
-                              minimumFractionDigits: 2,
-                              maximumFractionDigits: 2,
-                            })
-                          : '—'}
-                      </dd>
-                    </div>
-                    <div className="flex justify-between gap-4 tabular-nums">
-                      <dt className="text-zinc-500 dark:text-zinc-400">SMA 20</dt>
-                      <dd className="font-medium">
-                        {data.indicators.sma_20 != null
-                          ? data.indicators.sma_20.toLocaleString(undefined, {
-                              minimumFractionDigits: 2,
-                              maximumFractionDigits: 2,
-                            })
-                          : '—'}
-                      </dd>
-                    </div>
-                  </dl>
-                </div>
-              </div>
-            </div>
-
-            <p className="text-center text-xs text-zinc-500 dark:text-zinc-500">
-              Data from your FastAPI quote endpoint · Not financial advice
+        {phase === 'done' && (report || reportRaw) && (
+          <section className="flex flex-col gap-4 rounded-3xl border border-zinc-200/90 bg-white p-6 shadow-lg shadow-zinc-900/5 dark:border-zinc-800 dark:bg-zinc-900/85 dark:shadow-none">
+            <h2 className="text-base font-semibold text-zinc-900 dark:text-white">
+              Ask the advisor
+            </h2>
+            <p className="text-xs text-zinc-500 dark:text-zinc-400">
+              Questions use the completed report as context (same WebSocket).
             </p>
-          </div>
+            <div className="max-h-56 space-y-2 overflow-y-auto rounded-xl border border-zinc-100 bg-zinc-50/50 p-3 dark:border-zinc-800 dark:bg-zinc-950/40">
+              {chatMessages.length === 0 ? (
+                <p className="text-sm text-zinc-500">No messages yet.</p>
+              ) : (
+                chatMessages.map((m, i) => (
+                  <div
+                    key={i}
+                    className={`rounded-lg px-3 py-2 text-sm ${
+                      m.role === 'user'
+                        ? 'ml-6 bg-violet-100 text-violet-900 dark:bg-violet-950/60 dark:text-violet-100'
+                        : 'mr-6 bg-zinc-200/80 text-zinc-900 dark:bg-zinc-800 dark:text-zinc-100'
+                    }`}
+                  >
+                    {m.text}
+                  </div>
+                ))
+              )}
+            </div>
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+              <textarea
+                value={chatQuestion}
+                onChange={(e) => setChatQuestion(e.target.value)}
+                placeholder="Ask about the report…"
+                rows={2}
+                className="min-h-0 flex-1 rounded-xl border border-zinc-200 bg-white px-4 py-3 text-sm outline-none focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 dark:border-zinc-700 dark:bg-zinc-900"
+              />
+              <button
+                type="button"
+                onClick={sendChat}
+                disabled={!chatQuestion.trim()}
+                className="rounded-xl bg-zinc-900 px-5 py-2.5 text-sm font-semibold text-white hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-white"
+              >
+                Send
+              </button>
+            </div>
+          </section>
         )}
+
+        <p className="text-center text-xs text-zinc-500 dark:text-zinc-500">
+          Multi-agent pipeline via{' '}
+          <code className="rounded bg-zinc-200/60 px-1 dark:bg-zinc-800">{ANALYZE_WEBSOCKET_PATH}</code> · Not
+          financial advice
+        </p>
       </div>
     </div>
   )
