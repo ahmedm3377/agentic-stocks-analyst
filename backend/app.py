@@ -98,8 +98,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 'user_query': user_query
             }
             
-            # Kickoff the hierarchical manager
-            result = stock_crew.crew().kickoff(inputs=inputs)
+            # Kickoff the hierarchical manager (emits task_started for live UI)
+            result = stock_crew.kickoff_analysis(inputs)
             
             # Extract the data and send it back
             final_data = result.pydantic.model_dump() if result.pydantic else result.raw

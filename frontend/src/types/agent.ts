@@ -16,12 +16,18 @@ export type TaskOutputPayload = {
   truncated?: boolean
 }
 
+export type TaskStartedPayload = {
+  task_name: string
+  agent_role: string
+}
+
 export type AnalyzeServerMessage =
   | { type: 'status'; data: string }
   | { type: 'review_needed'; data: string }
   | { type: 'complete'; data: FinalReportData | string | Record<string, unknown> }
   | { type: 'error'; data: string }
   | { type: 'chat_response'; data: string }
+  | { type: 'task_started'; data: TaskStartedPayload }
   | { type: 'task_output'; data: TaskOutputPayload }
 
 export function isTaskOutputPayload(data: unknown): data is TaskOutputPayload {
@@ -32,6 +38,12 @@ export function isTaskOutputPayload(data: unknown): data is TaskOutputPayload {
     typeof o.agent_role === 'string' &&
     typeof o.output === 'string'
   )
+}
+
+export function isTaskStartedPayload(data: unknown): data is TaskStartedPayload {
+  if (typeof data !== 'object' || data === null) return false
+  const o = data as Record<string, unknown>
+  return typeof o.task_name === 'string' && typeof o.agent_role === 'string'
 }
 
 export function isFinalReportData(data: unknown): data is FinalReportData {

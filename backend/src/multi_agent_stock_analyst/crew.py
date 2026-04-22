@@ -2,8 +2,11 @@
 
 import json
 import os
+from typing import Any
 
 from crewai import Agent, Crew, Process, Task, LLM
+from crewai.events.event_bus import crewai_event_bus
+from crewai.events.types.task_events import TaskStartedEvent
 from crewai.project import CrewBase, agent, crew, task
 from crewai.tasks.task_output import TaskOutput
 from crewai_tools import TXTSearchTool
@@ -80,6 +83,38 @@ class MultiAgentStockAnalyst():
             shared_state=shared_state
         )
         self._send_ws = send_message_sync
+
+    def kickoff_analysis(self, inputs: dict) -> Any:
+        """Run the crew and emit ``task_started`` over WebSocket when each task begins."""
+        send = getattr(self, '_send_ws', None)
+        crew_instance = self.crew()
+
+        def on_task_started(_source: Any, event: TaskStartedEvent) -> None:
+            if send is None:
+                return
+            task = event.task
+            if task is None:
+                return
+            task_name = task.name or 'task'
+            if task_name == 'format_json_task':
+                return
+            agent = task.agent
+            agent_role = getattr(agent, 'role', None) if agent is not None else None
+            if not agent_role:
+                agent_role = 'Agent'
+            send({
+                'type': 'task_started',
+                'data': {
+                    'task_name': task_name,
+                    'agent_role': agent_role,
+                },
+            })
+
+        crewai_event_bus.on(TaskStartedEvent)(on_task_started)
+        try:
+            return crew_instance.kickoff(inputs=inputs)
+        finally:
+            crewai_event_bus.off(TaskStartedEvent, on_task_started)
 
     def _emit_task_output_ws(self, output: TaskOutput) -> None:
         send = getattr(self, '_send_ws', None)

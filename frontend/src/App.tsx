@@ -13,11 +13,12 @@ import {
   parsePreferencesContent,
   updatePreferences,
 } from './api/preferences'
-import { ANALYZE_WEBSOCKET_PATH, getAnalyzeWebSocketUrl } from './lib/backendUrl'
+import { getAnalyzeWebSocketUrl } from './lib/backendUrl'
 import {
   type FinalReportData,
   isFinalReportData,
   isTaskOutputPayload,
+  isTaskStartedPayload,
   type AnalyzeServerMessage,
   type TaskOutputPayload,
 } from './types/agent'
@@ -46,6 +47,13 @@ type AgentActivityItem =
   | {
       id: string
       ts: number
+      kind: 'working'
+      task_name: string
+      agent_role: string
+    }
+  | {
+      id: string
+      ts: number
       kind: 'task_output'
       task_name: string
       agent_role: string
@@ -67,6 +75,24 @@ type JsonTaskResult = {
   bear_case: string
   main_risks: string[]
   confidence_level: string
+}
+
+type ChatMessage = { id: string; role: 'user' | 'advisor'; text: string }
+
+const CHAT_SUGGESTIONS = [
+  'Summarize the thesis in two sentences.',
+  'What would most change your view on this name?',
+  'How should I think about timing an entry?',
+] as const
+
+function ChatTypingIndicator() {
+  return (
+    <div className="flex items-center gap-1.5 px-1 py-2" aria-label="Advisor is typing">
+      <span className="size-1.5 animate-bounce rounded-full bg-violet-500/80 [animation-delay:0ms]" />
+      <span className="size-1.5 animate-bounce rounded-full bg-violet-500/60 [animation-delay:150ms]" />
+      <span className="size-1.5 animate-bounce rounded-full bg-violet-500/40 [animation-delay:300ms]" />
+    </div>
+  )
 }
 
 function formatDuration(totalSec: number): string {
@@ -211,9 +237,9 @@ function App() {
   const [reportRaw, setReportRaw] = useState<string | null>(null)
   const [sessionError, setSessionError] = useState<string | null>(null)
   const [chatQuestion, setChatQuestion] = useState('')
-  const [chatMessages, setChatMessages] = useState<{ role: 'user' | 'advisor'; text: string }[]>(
-    [],
-  )
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
+  const [chatAwaitingReply, setChatAwaitingReply] = useState(false)
+  const chatEndRef = useRef<HTMLDivElement | null>(null)
 
   const [riskTolerance, setRiskTolerance] = useState('')
   const [investmentHorizon, setInvestmentHorizon] = useState('')
@@ -395,6 +421,9 @@ function App() {
     setSessionError(null)
     setChatMessages([])
     setChatQuestion('')
+    setChatAwaitingReply(false)
+    setProfileStepCompleted(false)
+    setFocusQuery('')
   }, [closeSocket])
 
   const handleServerMessage = useCallback(
@@ -406,6 +435,22 @@ function App() {
         case 'status':
           appendLog(typeof msg.data === 'string' ? msg.data : String(msg.data))
           break
+        case 'task_started': {
+          const started = msg.data
+          if (!isTaskStartedPayload(started)) break
+          if (started.task_name === 'format_json_task') break
+          setAgentActivities((prev) => [
+            ...prev,
+            {
+              id: crypto.randomUUID(),
+              ts: Date.now(),
+              kind: 'working',
+              task_name: started.task_name,
+              agent_role: started.agent_role,
+            },
+          ])
+          break
+        }
         case 'task_output': {
           const payload = msg.data
           if (!isTaskOutputPayload(payload)) break
@@ -421,18 +466,30 @@ function App() {
               truncated: payload.truncated,
             },
           ])
-          setAgentActivities((prev) => [
-            ...prev,
-            {
-              id: crypto.randomUUID(),
-              ts: Date.now(),
+          setAgentActivities((prev) => {
+            const now = Date.now()
+            let replaceIdx = -1
+            for (let i = prev.length - 1; i >= 0; i--) {
+              const it = prev[i]
+              if (it.kind === 'working' && it.task_name === payload.task_name) {
+                replaceIdx = i
+                break
+              }
+            }
+            const row: AgentActivityItem = {
+              id: replaceIdx >= 0 ? prev[replaceIdx]!.id : crypto.randomUUID(),
+              ts: now,
               kind: 'task_output',
               task_name: payload.task_name,
               agent_role: payload.agent_role,
               output: payload.output,
               truncated: payload.truncated,
-            },
-          ])
+            }
+            if (replaceIdx === -1) return [...prev, row]
+            const next = [...prev]
+            next[replaceIdx] = row
+            return next
+          })
           break
         }
         case 'review_needed':
@@ -466,13 +523,19 @@ function App() {
           const errText = typeof msg.data === 'string' ? msg.data : String(msg.data)
           appendLog(`Error: ${errText}`)
           setSessionError(errText)
+          setChatAwaitingReply(false)
           setPhase('failed')
           break
         }
         case 'chat_response':
+          setChatAwaitingReply(false)
           setChatMessages((prev) => [
             ...prev,
-            { role: 'advisor', text: typeof msg.data === 'string' ? msg.data : String(msg.data) },
+            {
+              id: crypto.randomUUID(),
+              role: 'advisor',
+              text: typeof msg.data === 'string' ? msg.data : String(msg.data),
+            },
           ])
           break
         default:
@@ -538,6 +601,7 @@ function App() {
     setCrewDeliverables([])
     setAgentActivities([])
     setChatMessages([])
+    setChatAwaitingReply(false)
     setPhase('running')
 
     const ws = ensureAnalyzeSocket()
@@ -578,7 +642,7 @@ function App() {
 
   const sendChat = useCallback(() => {
     const q = chatQuestion.trim()
-    if (!q) return
+    if (!q || chatAwaitingReply) return
     const ws = wsRef.current
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       setSessionError('Not connected. Run a new analysis to chat.')
@@ -592,10 +656,26 @@ function App() {
         : { ticker: ticker.trim().toUpperCase() }
 
     ws.send(JSON.stringify({ action: 'chat', question: q, context }))
-    setChatMessages((prev) => [...prev, { role: 'user', text: q }])
+    setChatAwaitingReply(true)
+    setChatMessages((prev) => [...prev, { id: crypto.randomUUID(), role: 'user', text: q }])
     setChatQuestion('')
     appendLog(`Chat: ${q}`)
-  }, [appendLog, chatQuestion, report, reportRaw, ticker])
+  }, [appendLog, chatAwaitingReply, chatQuestion, report, reportRaw, ticker])
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+  }, [chatMessages, chatAwaitingReply])
+
+  function onChatKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      sendChat()
+    }
+  }
+
+  const insertChatSuggestion = useCallback((text: string) => {
+    setChatQuestion(text)
+  }, [])
 
   const analysisLocked = !profileStepCompleted
   const showProfileWidget = !profileStepCompleted
@@ -1117,7 +1197,7 @@ function App() {
                       Agents activities
                     </h2>
                     <p className="mt-0.5 max-w-xl text-[11px] leading-relaxed text-zinc-600 dark:text-zinc-400">
-                      Live status from the crew and completed task outputs as they finish — all on one feed.
+                      Each task shows who is working first; the row updates in place when the result arrives.
                     </p>
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
@@ -1151,6 +1231,44 @@ function App() {
                       const isLatest = i === agentActivities.length - 1
                       const livePulse =
                         isLatest && (phase === 'running' || phase === 'awaiting_feedback')
+                      if (item.kind === 'working') {
+                        return (
+                          <li key={item.id} className="py-3">
+                            <div className="flex gap-3 px-1">
+                              <time
+                                className="shrink-0 tabular-nums text-[10px] font-medium text-zinc-400 dark:text-zinc-500"
+                                dateTime={new Date(item.ts).toISOString()}
+                              >
+                                {new Date(item.ts).toLocaleTimeString(undefined, {
+                                  hour: '2-digit',
+                                  minute: '2-digit',
+                                  second: '2-digit',
+                                })}
+                              </time>
+                              <div className="min-w-0 flex-1">
+                                {/* <p className="text-sm font-semibold leading-snug text-zinc-900 dark:text-white">
+                                  {item.agent_role}
+                                </p> */}
+                                <p className="mt-1 flex items-center gap-2 text-xs leading-snug text-zinc-600 dark:text-zinc-400">
+                                  <SearchSpinner className="size-3.5" />
+                                  <span>
+                                    <span className="font-medium text-zinc-800 dark:text-zinc-200">
+                                      {formatCrewTaskTitle(item.task_name)} is working.
+                                    </span>
+                                    …
+                                  </span>
+                                </p>
+                              </div>
+                              {livePulse && (
+                                <span
+                                  className="mt-1 size-2 shrink-0 rounded-full bg-violet-500 shadow-[0_0_8px_rgba(139,92,246,0.8)]"
+                                  aria-hidden
+                                />
+                              )}
+                            </div>
+                          </li>
+                        )
+                      }
                       if (item.kind === 'status') {
                         return (
                           <li key={item.id} className="py-2.5">
@@ -1458,55 +1576,153 @@ function App() {
         )}
 
         {phase === 'done' && (report || reportRaw) && (
-          <section className="flex flex-col gap-4 rounded-3xl border border-zinc-200/90 bg-white p-6 shadow-lg shadow-zinc-900/5 dark:border-zinc-800 dark:bg-zinc-900/85 dark:shadow-none">
-            <h2 className="text-base font-semibold text-zinc-900 dark:text-white">
-              Ask the advisor
-            </h2>
-            <p className="text-xs text-zinc-500 dark:text-zinc-400">
-              Questions use the completed report as context (same WebSocket).
-            </p>
-            <div className="max-h-56 space-y-2 overflow-y-auto rounded-xl border border-zinc-100 bg-zinc-50/50 p-3 dark:border-zinc-800 dark:bg-zinc-950/40">
-              {chatMessages.length === 0 ? (
-                <p className="text-sm text-zinc-500">No messages yet.</p>
-              ) : (
-                chatMessages.map((m, i) => (
-                  <div
-                    key={i}
-                    className={`rounded-lg px-3 py-2 text-sm ${
-                      m.role === 'user'
-                        ? 'ml-6 bg-violet-100 text-violet-900 dark:bg-violet-950/60 dark:text-violet-100'
-                        : 'mr-6 bg-zinc-200/80 text-zinc-900 dark:bg-zinc-800 dark:text-zinc-100'
-                    }`}
-                  >
-                    {m.text}
-                  </div>
-                ))
-              )}
+          <section className="overflow-hidden rounded-3xl border border-zinc-200/90 bg-white shadow-[0_20px_50px_-12px_rgba(109,40,217,0.1)] ring-1 ring-violet-500/5 dark:border-zinc-800 dark:bg-zinc-900 dark:shadow-[0_20px_50px_-12px_rgba(0,0,0,0.4)] dark:ring-violet-500/10">
+            <div className="relative border-b border-zinc-100 bg-linear-to-br from-violet-500/8 via-white to-teal-500/5 px-5 py-5 sm:px-6 dark:border-zinc-800 dark:from-violet-500/12 dark:via-zinc-900 dark:to-teal-500/8">
+              <div className="flex flex-wrap items-start gap-4">
+                <div
+                  className="flex size-12 shrink-0 items-center justify-center rounded-2xl bg-violet-600/15 text-violet-700 shadow-inner dark:bg-violet-500/20 dark:text-violet-200"
+                  aria-hidden
+                >
+                  <svg className="size-6" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M8.625 12a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H8.25m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H12m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0h-.375M21 12c0 4.556-4.03 8.25-9 8.25a9.764 9.764 0 01-2.555-.337A5.972 5.972 0 015.41 20.97a5.969 5.969 0 01-.474-.065 4.48 4.48 0 00.978-2.025c.09-.457-.133-.901-.467-1.226C3.93 16.178 3 14.189 3 12c0-4.556 4.03-8.25 9-8.25s9 3.694 9 8.25z"
+                    />
+                  </svg>
+                </div>
+                <div className="min-w-0 flex-1">
+                  <h2 className="text-lg font-semibold tracking-tight text-zinc-900 dark:text-white">
+                    Advisor chat
+                  </h2>
+                  <p className="mt-1 max-w-lg text-sm leading-relaxed text-zinc-600 dark:text-zinc-400">
+                    Follow-ups use your completed report as context. Press{' '}
+                    <kbd className="rounded border border-zinc-300 bg-zinc-100 px-1.5 py-0.5 font-mono text-[10px] font-medium text-zinc-700 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
+                      Enter
+                    </kbd>{' '}
+                    to send,{' '}
+                    <kbd className="rounded border border-zinc-300 bg-zinc-100 px-1.5 py-0.5 font-mono text-[10px] font-medium text-zinc-700 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
+                      Shift+Enter
+                    </kbd>{' '}
+                    for a new line.
+                  </p>
+                </div>
+                {wsConnected ? (
+                  <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/15 px-2.5 py-1 text-[11px] font-semibold text-emerald-800 dark:text-emerald-300">
+                    <span className="size-1.5 rounded-full bg-emerald-500" />
+                    Connected
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-500/15 px-2.5 py-1 text-[11px] font-semibold text-amber-900 dark:text-amber-200">
+                    <span className="size-1.5 rounded-full bg-amber-500" />
+                    Reconnect to send
+                  </span>
+                )}
+              </div>
             </div>
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
-              <textarea
-                value={chatQuestion}
-                onChange={(e) => setChatQuestion(e.target.value)}
-                placeholder="Ask about the report…"
-                rows={2}
-                className="min-h-0 flex-1 rounded-xl border border-zinc-200 bg-white px-4 py-3 text-sm outline-none focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 dark:border-zinc-700 dark:bg-zinc-900"
-              />
-              <button
-                type="button"
-                onClick={sendChat}
-                disabled={!chatQuestion.trim()}
-                className="rounded-xl bg-zinc-900 px-5 py-2.5 text-sm font-semibold text-white hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-white"
-              >
-                Send
-              </button>
+
+            <div className="flex flex-col gap-4 p-5 sm:p-6">
+              <div className="flex max-h-72 min-h-40 flex-col gap-3 overflow-y-auto rounded-2xl bg-zinc-50/90 p-4 dark:bg-zinc-950/50">
+                {chatMessages.length === 0 && !chatAwaitingReply ? (
+                  <div className="flex flex-1 flex-col items-center justify-center gap-4 py-6 text-center">
+                    <p className="max-w-sm text-sm text-zinc-500 dark:text-zinc-400">
+                      Ask anything about the report—risk, catalysts, or how it fits your goals.
+                    </p>
+                    <div className="flex flex-wrap justify-center gap-2">
+                      {CHAT_SUGGESTIONS.map((s) => (
+                        <button
+                          key={s}
+                          type="button"
+                          onClick={() => insertChatSuggestion(s)}
+                          className="rounded-full border border-violet-200/80 bg-white px-3 py-1.5 text-left text-xs font-medium text-violet-800 shadow-sm transition hover:border-violet-300 hover:bg-violet-50 dark:border-violet-800/60 dark:bg-zinc-900 dark:text-violet-200 dark:hover:bg-violet-950/40"
+                        >
+                          {s}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    {chatMessages.map((m) => (
+                      <div
+                        key={m.id}
+                        className={`flex gap-3 ${m.role === 'user' ? 'flex-row-reverse' : 'flex-row'}`}
+                      >
+                        <div
+                          className={`flex size-8 shrink-0 items-center justify-center rounded-xl text-[10px] font-bold ${
+                            m.role === 'user'
+                              ? 'bg-violet-600 text-white shadow-sm shadow-violet-900/20'
+                              : 'bg-zinc-200 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200'
+                          }`}
+                          aria-hidden
+                        >
+                          {m.role === 'user' ? 'You' : 'AI'}
+                        </div>
+                        <div
+                          className={`max-w-[min(100%,28rem)] rounded-2xl px-4 py-3 text-sm leading-relaxed shadow-sm ${
+                            m.role === 'user'
+                              ? 'bg-linear-to-br from-violet-600 to-violet-700 text-white dark:from-violet-600 dark:to-violet-800'
+                              : 'border border-zinc-200/80 bg-white text-zinc-800 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100'
+                          }`}
+                        >
+                          <p className="whitespace-pre-wrap wrap-break-word">{m.text}</p>
+                        </div>
+                      </div>
+                    ))}
+                    {chatAwaitingReply && (
+                      <div className="flex gap-3">
+                        <div
+                          className="flex size-8 shrink-0 items-center justify-center rounded-xl bg-zinc-200 text-[10px] font-bold text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
+                          aria-hidden
+                        >
+                          AI
+                        </div>
+                        <div className="rounded-2xl border border-zinc-200/80 bg-white px-4 py-3 dark:border-zinc-700 dark:bg-zinc-900">
+                          <ChatTypingIndicator />
+                        </div>
+                      </div>
+                    )}
+                    <div ref={chatEndRef} />
+                  </>
+                )}
+              </div>
+
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
+                <label className="sr-only" htmlFor="advisor-chat-input">
+                  Message to advisor
+                </label>
+                <textarea
+                  id="advisor-chat-input"
+                  value={chatQuestion}
+                  onChange={(e) => setChatQuestion(e.target.value)}
+                  onKeyDown={onChatKeyDown}
+                  placeholder="Ask about the report…"
+                  rows={2}
+                  disabled={chatAwaitingReply}
+                  className="min-h-22 flex-1 resize-y rounded-2xl border border-zinc-200 bg-white px-4 py-3 text-sm leading-relaxed text-zinc-900 shadow-inner shadow-zinc-900/5 outline-none transition placeholder:text-zinc-400 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 disabled:cursor-not-allowed disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100 dark:placeholder:text-zinc-500 dark:focus:border-violet-500"
+                />
+                <button
+                  type="button"
+                  onClick={sendChat}
+                  disabled={!chatQuestion.trim() || chatAwaitingReply || !wsConnected}
+                  className="inline-flex shrink-0 items-center justify-center gap-2 rounded-2xl bg-zinc-900 px-6 py-3 text-sm font-semibold text-white shadow-md shadow-zinc-900/15 transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-45 dark:bg-violet-600 dark:shadow-violet-900/25 dark:hover:bg-violet-500"
+                >
+                  {chatAwaitingReply ? (
+                    <>
+                      <SearchSpinner className="size-4 border-white border-t-transparent dark:border-white dark:border-t-transparent" />
+                      Sending…
+                    </>
+                  ) : (
+                    'Send'
+                  )}
+                </button>
+              </div>
             </div>
           </section>
         )}
 
         <p className="text-center text-xs text-zinc-500 dark:text-zinc-500">
-          Multi-agent pipeline via{' '}
-          <code className="rounded bg-zinc-200/60 px-1 dark:bg-zinc-800">{ANALYZE_WEBSOCKET_PATH}</code> · Not
-          financial advice
+          Multi-agent pipeline for financial advice.
         </p>
       </div>
     </div>
