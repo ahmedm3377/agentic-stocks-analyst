@@ -19,6 +19,7 @@ import {
   postAnalyzeFeedback,
   startAnalyzeSession,
 } from './api/analyzeSession'
+import { randomId } from './lib/randomId'
 import {
   type FinalReportData,
   isFinalReportData,
@@ -398,11 +399,11 @@ function App() {
   const appendLog = useCallback((line: string) => {
     setActivityEntries((prev) => [
       ...prev,
-      { id: crypto.randomUUID(), message: line, ts: Date.now() },
+      { id: randomId(), message: line, ts: Date.now() },
     ])
     setAgentActivities((prev) => [
       ...prev,
-      { id: crypto.randomUUID(), ts: Date.now(), kind: 'status', message: line },
+      { id: randomId(), ts: Date.now(), kind: 'status', message: line },
     ])
   }, [])
 
@@ -453,7 +454,7 @@ function App() {
           setAgentActivities((prev) => [
             ...prev,
             {
-              id: crypto.randomUUID(),
+              id: randomId(),
               ts: Date.now(),
               kind: 'working',
               task_name: started.task_name,
@@ -469,7 +470,7 @@ function App() {
           setCrewDeliverables((prev) => [
             ...prev,
             {
-              id: crypto.randomUUID(),
+              id: randomId(),
               ts: Date.now(),
               task_name: payload.task_name,
               agent_role: payload.agent_role,
@@ -488,7 +489,7 @@ function App() {
               }
             }
             const row: AgentActivityItem = {
-              id: replaceIdx >= 0 ? prev[replaceIdx]!.id : crypto.randomUUID(),
+              id: replaceIdx >= 0 ? prev[replaceIdx]!.id : randomId(),
               ts: now,
               kind: 'task_output',
               task_name: payload.task_name,
@@ -543,7 +544,7 @@ function App() {
           setChatMessages((prev) => [
             ...prev,
             {
-              id: crypto.randomUUID(),
+              id: randomId(),
               role: 'advisor',
               text: typeof msg.data === 'string' ? msg.data : String(msg.data),
             },
@@ -659,7 +660,7 @@ function App() {
     try {
       await postAnalyzeChat(analyzeSessionId, q, context)
       setChatAwaitingReply(true)
-      setChatMessages((prev) => [...prev, { id: crypto.randomUUID(), role: 'user', text: q }])
+      setChatMessages((prev) => [...prev, { id: randomId(), role: 'user', text: q }])
       setChatQuestion('')
       appendLog(`Chat: ${q}`)
     } catch (e) {
