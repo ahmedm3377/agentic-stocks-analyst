@@ -1,117 +1,133 @@
-# WebSocket API Integration Guide: Agentic Stock Analyst
+# HTTP polling API: Agentic Stock Analyst
 
-This guide explains how to connect to, use, and test the CrewAI multi-agent WebSocket endpoint using Postman.
+The multi-agent analyze flow uses **HTTP** (no WebSocket): you **start** a session, **poll** for events (same JSON shapes as before), then **POST** feedback or chat on the same `session_id`.
 
-## 🔗 Endpoint Details
-
-- **Protocol**: WebSocket (`ws://`)
-- **URL**: `ws://127.0.0.1:8000/api/analyze` *(assuming default local Uvicorn port)*
+Base URL examples: `http://127.0.0.1:8000` (local), or your deployed API origin.
 
 ---
 
-## 🛠️ Step 1: Set Up Postman for WebSockets
+## 1. Start an analysis
 
-1. Open Postman.
-2. Click **New** > **WebSocket**.
-3. In the URL bar, enter: `ws://127.0.0.1:8000/api/analyze`
-4. Click **Connect**. (You should see a "Connected" message in the lower console).
-5. Ensure the message format is set to **JSON**.
+**`POST /api/analyze/start`**
 
----
-
-## 🚀 Step 2: The Core Analysis Flow (Human-in-the-Loop)
-
-The primary workflow requires a back-and-forth interaction. The backend will pause and wait for user feedback before generating the final JSON report.
-
-### 1. Trigger the Analysis
-
-Send the `start` action to wake up the agents and begin the research phase.
-
-**Send Message:**
+Body:
 
 ```json
 {
-    "action": "start",
+  "ticker": "TSLA",
+  "query": "What are the latest news catalysts for this stock?"
+}
+```
+
+Response:
+
+```json
+{ "session_id": "8f3c2e1a-..." }
+```
+
+---
+
+## 2. Poll for events
+
+**`GET /api/analyze/session/{session_id}/poll?after=0`**
+
+- `after` is the last `next_after` value you received (start with `0`).
+- Response:
+
+```json
+{
+  "events": [
+    { "type": "status", "data": "Processing query for TSLA: ..." },
+    { "type": "task_started", "data": { "task_name": "...", "agent_role": "..." } },
+    { "type": "task_output", "data": { "task_name": "...", "agent_role": "...", "output": "..." } }
+  ],
+  "next_after": 12
+}
+```
+
+Poll periodically (e.g. every 500–1000 ms) until you see `complete`, `error`, or you stop.
+
+---
+
+## 3. Human review (draft ready)
+
+When polling returns:
+
+```json
+{
+  "type": "review_needed",
+  "data": "MARKET VIEW:\n..."
+}
+```
+
+**`POST /api/analyze/session/{session_id}/feedback`**
+
+```json
+{
+  "message": "Rewrite the report to be more concise..."
+}
+```
+
+Continue polling; the crew resumes and later emits `complete` or `error`.
+
+---
+
+## 4. Final report
+
+Event shape (unchanged):
+
+```json
+{
+  "type": "complete",
+  "data": {
     "ticker": "TSLA",
-    "query": "What are the latest news catalysts for this stock?"
-}
-
-```
-
-### 2. Wait for the Draft
-
-The server will stream status messages while the agents work. Eventually, it will send a review_needed payload containing the plain-text draft.
-
-Expected Server Response:
-
-```JSON
-{
-    "type": "review_needed",
-    "data": "MARKET VIEW:\nTSLA appears suitable only for a cautious... [rest of draft]"
+    "market_view": "...",
+    "trend": "...",
+    "key_catalysts": ["..."],
+    "bull_case": "...",
+    "bear_case": "...",
+    "main_risks": ["..."],
+    "confidence_level": "..."
+  }
 }
 ```
 
-### 3. Send Human Feedback
+---
 
-The backend is now paused. Read the draft and send your feedback using the feedback action. The agents will rewrite the draft based exactly on these instructions.
+## 5. Follow-up chat (same session)
 
-Send Message:
+**`POST /api/analyze/session/{session_id}/chat`**
 
-```JSON
+```json
 {
-    "action": "feedback",
-    "message": "Rewrite the entire report to be extremely concise. Limit the key_catalysts to only 3 bullet points, and make the bull_case just one short sentence."
+  "question": "What exactly do they mean by …?",
+  "context": {
+    "ticker": "TSLA",
+    "market_view": "...",
+    "bear_case": "..."
+  }
 }
 ```
 
-### 4. Receive Final JSON Report
+Keep polling; you will receive:
 
-The formatting agent will convert the approved draft into strict JSON. The connection will remain open for follow-up questions.
-
-Expected Server Response:
-
-```JSON
-{
-    "type": "complete",
-    "data": {
-        "ticker": "TSLA",
-        "market_view": "...",
-        "trend": "...",
-        "key_catalysts": ["...", "...", "..."],
-        "bull_case": "...",
-        "bear_case": "...",
-        "main_risks": ["..."],
-        "confidence_level": "..."
-    }
+```json
+{ "type": "chat_response", "data": "..." }
 ```
 
-### Step 3: The Follow-Up Chat Flow
+Errors are emitted as `{ "type": "error", "data": "..." }` like before.
 
-Once the report is complete, you can ask the Knowledge Advisor questions about the report without running the entire analysis pipeline again.
+---
 
-1. Ask a Question
-Send the chat action, passing in the user's question and the data object you received from the complete payload.
+## Other endpoints
 
-Send Message:
+- **`GET /api/health`** — liveness.
+- **`GET` / `POST /api/preferences`** — investment profile text for RAG.
+- **`GET /api/stock/...`** — quotes, news, etc.
+- **`WebSocket /api/stock/live/{ticker}`** — optional live quote stream (unchanged).
 
-```JSON
-{
-    "action": "chat",
-    "question": "What exactly do they mean by 'Optimus skepticism' in the bear case?",
-    "context": {
-        "ticker": "TSLA",
-        "market_view": "...",
-        "bear_case": "...",
-        "main_risks": ["..."]
-    }
-}
-2. Receive the Answer
-The advisor will return a conversational string.
+---
 
-Expected Server Response:
+## Production note
 
-```JSON
-{
-    "type": "chat_response",
-    "data": "Optimus skepticism refers to doubts among investors regarding Tesla's ability to successfully commercialize its humanoid robot..."
-}
+You **do not** need WebSocket proxy rules on Nginx for `/api/analyze` anymore; standard HTTP `proxy_pass` for `/api/` is enough. If you still use the live quote WebSocket, keep `Upgrade` headers only for that path if you split routes.

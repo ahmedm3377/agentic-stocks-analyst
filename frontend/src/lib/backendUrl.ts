@@ -1,13 +1,12 @@
 /**
- * Crew session WebSocket — must match FastAPI `ANALYZE_WEBSOCKET_PATH`.
- * All frames (status, task_output, review_needed, complete, chat_response, error) use this URL.
+ * HTTP API origin for REST calls (`''` = same origin; Vite dev proxy forwards `/api`).
  */
-export const ANALYZE_WEBSOCKET_PATH = '/api/analyze' as const
+export function getApiBase(): string {
+  return (import.meta.env.VITE_API_BASE as string | undefined) ?? ''
+}
 
 /**
- * Build a WebSocket URL for the FastAPI backend.
- * In dev, Vite proxies `/api` to 127.0.0.1:8000, so use the page host when
- * VITE_API_BASE is unset. With VITE_API_BASE set, connect directly to that host.
+ * Build a WebSocket URL for endpoints that still use WS (e.g. live quotes).
  */
 export function getBackendWsUrl(path: string): string {
   const normalized = path.startsWith('/') ? path : `/${path}`
@@ -21,9 +20,4 @@ export function getBackendWsUrl(path: string): string {
 
   const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   return `${wsProtocol}//${window.location.host}${normalized}`
-}
-
-/** WebSocket URL for the multi-agent analyze session (`/api/analyze`). */
-export function getAnalyzeWebSocketUrl(): string {
-  return getBackendWsUrl(ANALYZE_WEBSOCKET_PATH)
 }

@@ -1,10 +1,13 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import asyncio
 import threading
+import uuid
 import uvicorn
 from dotenv import load_dotenv
 import os
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -29,10 +32,61 @@ from src.multi_agent_stock_analyst.utils import (
 
 load_dotenv()
 
-# WebSocket route for crew runs — client must connect here (see frontend `ANALYZE_WEBSOCKET_PATH`).
-ANALYZE_WEBSOCKET_PATH = "/api/analyze"
-
 PREF_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge", "user_preference.txt")
+
+
+class AnalyzeStartRequest(BaseModel):
+    ticker: str = "AAPL"
+    query: str = ""
+
+
+class AnalyzeFeedbackRequest(BaseModel):
+    message: str = ""
+
+
+class AnalyzeChatRequest(BaseModel):
+    question: str
+    context: Any = None
+
+
+class AnalyzeSession:
+    """Server-side buffer for one analyze/chat session (HTTP polling)."""
+
+    __slots__ = ("lock", "seq", "events", "wait_event", "shared_state")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.seq = 0
+        self.events: list[dict] = []
+        self.wait_event = threading.Event()
+        self.shared_state: dict = {}
+
+
+SESSIONS: dict[str, AnalyzeSession] = {}
+SESSIONS_GUARD = threading.Lock()
+
+
+def _emit_analyze_event(session_id: str, message: dict) -> None:
+    with SESSIONS_GUARD:
+        sess = SESSIONS.get(session_id)
+    if sess is None:
+        return
+    with sess.lock:
+        sess.seq += 1
+        entry: dict = {"seq": sess.seq}
+        entry.update(message)
+        sess.events.append(entry)
+
+
+def _poll_analyze_session(session_id: str, after: int) -> tuple[list[dict], int]:
+    with SESSIONS_GUARD:
+        sess = SESSIONS.get(session_id)
+    if sess is None:
+        raise HTTPException(status_code=404, detail="Unknown analyze session")
+    with sess.lock:
+        out = [{k: v for k, v in e.items() if k != "seq"} for e in sess.events if e["seq"] > after]
+        high = max((e["seq"] for e in sess.events), default=0)
+    return out, high
 
 
 app = FastAPI(title="Agentic Stock Analyst")
@@ -53,104 +107,88 @@ async def health_check():
         "version": "1.0.0"
     }
 
-@app.websocket(ANALYZE_WEBSOCKET_PATH)
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    
-    # These variables manage the cross-thread communication
-    wait_event = threading.Event()
-    shared_state = {}
+@app.post("/api/analyze/start")
+async def analyze_start(body: AnalyzeStartRequest):
+    """Begin a crew run; client polls ``/api/analyze/session/{id}/poll`` for the same event shapes as before."""
+    session_id = str(uuid.uuid4())
+    sess = AnalyzeSession()
+    with SESSIONS_GUARD:
+        SESSIONS[session_id] = sess
 
-    # Capture the main thread's event loop HERE
-    main_loop = asyncio.get_running_loop()
+    ticker = (body.ticker or "AAPL").strip() or "AAPL"
+    user_query = body.query or ""
 
-    # Helper function to let the synchronous Crew thread send async WebSocket messages
     def send_message_sync(message: dict):
-        try:
-            # Only try to send the message if the main event loop is still alive
-            if not main_loop.is_closed():
-                asyncio.run_coroutine_threadsafe(websocket.send_json(message), main_loop)
-        except Exception as e:
-            print(f"Failed to send WebSocket message (client likely disconnected): {e}")
+        _emit_analyze_event(session_id, message)
 
-    # Function to run the Crew (this will run in a separate thread)
-    def run_crew(ticker: str, user_query: str = ""):
+    def run_crew(tk: str, uq: str):
         try:
-            # Update status message based on whether it's a standard analysis or a custom query
-            if user_query:
-                send_message_sync({"type": "status", "data": f"Processing query for {ticker}: {user_query}..."})
+            if uq:
+                send_message_sync({"type": "status", "data": f"Processing query for {tk}: {uq}..."})
             else:
-                send_message_sync({"type": "status", "data": f"Starting full analysis for {ticker}..."})
-            
-            # 1. Instantiate the crew completely empty to avoid decorator bugs
+                send_message_sync({"type": "status", "data": f"Starting full analysis for {tk}..."})
+
             stock_crew = MultiAgentStockAnalyst()
-            
-            # 2. Inject the threading bridges using our custom method
+            with SESSIONS_GUARD:
+                s = SESSIONS.get(session_id)
+            if s is None:
+                return
             stock_crew.setup_websocket(
                 send_message_sync=send_message_sync,
-                wait_event=wait_event,
-                shared_state=shared_state
+                wait_event=s.wait_event,
+                shared_state=s.shared_state,
             )
-            
-            # 3. Pass BOTH the ticker and the custom user query into the Crew inputs
-            inputs = {
-                'ticker': ticker,
-                'user_query': user_query
-            }
-            
-            # Kickoff the hierarchical manager (emits task_started for live UI)
+            inputs = {"ticker": tk, "user_query": uq}
             result = stock_crew.kickoff_analysis(inputs)
-            
-            # Extract the data and send it back
             final_data = result.pydantic.model_dump() if result.pydantic else result.raw
             send_message_sync({"type": "complete", "data": final_data})
-            
         except Exception as e:
             send_message_sync({"type": "error", "data": str(e)})
 
-    try:
-        # Listen for messages from the frontend
-        while True:
-            data = await websocket.receive_json()
-            action = data.get("action")
-            
-            if action == "start":
-                # User requested an analysis or asked a question
-                ticker = data.get("ticker", "AAPL")
-                user_query = data.get("query", "") # Extract custom query if provided
-                
-                # Run the crew in a background thread
-                threading.Thread(target=run_crew, args=(ticker, user_query)).start()
-                
-            elif action == "feedback":
-                # User submitted their review. Save it and wake up the Crew thread!
-                shared_state['feedback'] = data.get("message")
-                wait_event.set() 
-            
-            elif action == "chat":
-                # User is asking a question about the finished report
-                question = data.get("question")
-                report_context = data.get("context") 
-                
-                def run_chat():
-                    try:
-                        send_message_sync({"type": "status", "data": "Consulting advisor..."})
-                        stock_crew = MultiAgentStockAnalyst()
-                        
-                        # Call our new mini-crew method
-                        answer = stock_crew.answer_follow_up(question, report_context)
-                        
-                        # Send the answer back to the UI
-                        send_message_sync({"type": "chat_response", "data": answer})
-                    except Exception as e:
-                        send_message_sync({"type": "error", "data": str(e)})
+    threading.Thread(target=run_crew, args=(ticker, user_query), daemon=True).start()
+    return {"session_id": session_id}
 
-                # Run the chat in a background thread so the socket doesn't block
-                threading.Thread(target=run_chat).start()
 
-    except WebSocketDisconnect:
-        print("Client disconnected.")
-        
+@app.get("/api/analyze/session/{session_id}/poll")
+async def analyze_poll(session_id: str, after: int = 0):
+    """Return new events since ``after`` (monotonic seq). Same JSON objects as the old WebSocket frames."""
+    events, next_after = _poll_analyze_session(session_id, after)
+    return {"events": events, "next_after": next_after}
+
+
+@app.post("/api/analyze/session/{session_id}/feedback")
+async def analyze_feedback(session_id: str, body: AnalyzeFeedbackRequest):
+    with SESSIONS_GUARD:
+        sess = SESSIONS.get(session_id)
+    if sess is None:
+        raise HTTPException(status_code=404, detail="Unknown analyze session")
+    sess.shared_state["feedback"] = body.message
+    sess.wait_event.set()
+    return {"ok": True}
+
+
+@app.post("/api/analyze/session/{session_id}/chat")
+async def analyze_chat(session_id: str, body: AnalyzeChatRequest):
+    with SESSIONS_GUARD:
+        if session_id not in SESSIONS:
+            raise HTTPException(status_code=404, detail="Unknown analyze session")
+
+    def send_message_sync(message: dict):
+        _emit_analyze_event(session_id, message)
+
+    def run_chat():
+        try:
+            send_message_sync({"type": "status", "data": "Consulting advisor..."})
+            stock_crew = MultiAgentStockAnalyst()
+            raw_ctx = body.context
+            ctx: dict = raw_ctx if isinstance(raw_ctx, dict) else {}
+            answer = stock_crew.answer_follow_up(body.question, ctx)
+            send_message_sync({"type": "chat_response", "data": answer})
+        except Exception as e:
+            send_message_sync({"type": "error", "data": str(e)})
+
+    threading.Thread(target=run_chat, daemon=True).start()
+    return {"ok": True}
 
 
 @app.get("/api/preferences")

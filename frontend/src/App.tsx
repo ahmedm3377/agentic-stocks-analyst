@@ -13,7 +13,12 @@ import {
   parsePreferencesContent,
   updatePreferences,
 } from './api/preferences'
-import { getAnalyzeWebSocketUrl } from './lib/backendUrl'
+import {
+  pollAnalyzeSession,
+  postAnalyzeChat,
+  postAnalyzeFeedback,
+  startAnalyzeSession,
+} from './api/analyzeSession'
 import {
   type FinalReportData,
   isFinalReportData,
@@ -217,15 +222,17 @@ const INVESTMENT_HORIZON_PRESETS = [
 ] as const
 
 function App() {
-  const wsRef = useRef<WebSocket | null>(null)
   const horizonListId = useId()
   const horizonBlurTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const analysisStartRef = useRef<number | null>(null)
+  const pollAfterRef = useRef(0)
+  const pollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const [ticker, setTicker] = useState('AAPL')
   const [focusQuery, setFocusQuery] = useState('')
   const [phase, setPhase] = useState<SessionPhase>('idle')
-  const [wsConnected, setWsConnected] = useState(false)
+  const [analyzeSessionId, setAnalyzeSessionId] = useState<string | null>(null)
+  const [analyzeSessionActive, setAnalyzeSessionActive] = useState(false)
   const [activityEntries, setActivityEntries] = useState<ActivityEntry[]>([])
   const [crewDeliverables, setCrewDeliverables] = useState<CrewDeliverable[]>([])
   const [agentActivities, setAgentActivities] = useState<AgentActivityItem[]>([])
@@ -399,14 +406,18 @@ function App() {
     ])
   }, [])
 
-  const closeSocket = useCallback(() => {
-    wsRef.current?.close()
-    wsRef.current = null
-    setWsConnected(false)
+  const stopAnalyzeSession = useCallback(() => {
+    if (pollTimeoutRef.current != null) {
+      clearTimeout(pollTimeoutRef.current)
+      pollTimeoutRef.current = null
+    }
+    setAnalyzeSessionId(null)
+    pollAfterRef.current = 0
+    setAnalyzeSessionActive(false)
   }, [])
 
   const resetSession = useCallback(() => {
-    closeSocket()
+    stopAnalyzeSession()
     setPhase('idle')
     analysisStartRef.current = null
     setElapsedSec(0)
@@ -424,7 +435,7 @@ function App() {
     setChatAwaitingReply(false)
     setProfileStepCompleted(false)
     setFocusQuery('')
-  }, [closeSocket])
+  }, [stopAnalyzeSession])
 
   const handleServerMessage = useCallback(
     (raw: unknown) => {
@@ -545,48 +556,43 @@ function App() {
     [appendLog],
   )
 
-  const ensureAnalyzeSocket = useCallback((): WebSocket | null => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      return wsRef.current
-    }
-    if (wsRef.current?.readyState === WebSocket.CONNECTING) {
-      return wsRef.current
-    }
+  useEffect(() => {
+    if (!analyzeSessionId) return
 
-    const ws = new WebSocket(getAnalyzeWebSocketUrl())
-    wsRef.current = ws
+    let cancelled = false
 
-    ws.onopen = () => {
-      setWsConnected(true)
-      setSessionError(null)
-    }
-
-    ws.onmessage = (event) => {
+    const loop = async () => {
+      if (cancelled) return
       try {
-        const parsed = JSON.parse(event.data) as unknown
-        handleServerMessage(parsed)
+        const { events, next_after } = await pollAnalyzeSession(
+          analyzeSessionId,
+          pollAfterRef.current,
+        )
+        if (cancelled) return
+        pollAfterRef.current = next_after
+        for (const ev of events) {
+          handleServerMessage(ev)
+        }
       } catch {
-        appendLog(`(non-JSON message) ${event.data}`)
+        /* keep polling on transient errors */
+      }
+      if (!cancelled) {
+        pollTimeoutRef.current = window.setTimeout(() => void loop(), 700)
       }
     }
 
-    ws.onerror = () => {
-      setSessionError('WebSocket connection error. Is the backend running on port 8000?')
-      setPhase('failed')
-      setWsConnected(false)
-    }
+    void loop()
 
-    ws.onclose = () => {
-      setWsConnected(false)
-      if (wsRef.current === ws) {
-        wsRef.current = null
+    return () => {
+      cancelled = true
+      if (pollTimeoutRef.current != null) {
+        clearTimeout(pollTimeoutRef.current)
+        pollTimeoutRef.current = null
       }
     }
+  }, [analyzeSessionId, handleServerMessage])
 
-    return ws
-  }, [appendLog, handleServerMessage])
-
-  const sendStart = useCallback(() => {
+  const sendStart = useCallback(async () => {
     const sym = ticker.trim().toUpperCase()
     if (!sym) return
 
@@ -603,49 +609,44 @@ function App() {
     setChatMessages([])
     setChatAwaitingReply(false)
     setPhase('running')
+    pollAfterRef.current = 0
 
-    const ws = ensureAnalyzeSocket()
-    if (!ws) return
-
-    const payload = {
-      action: 'start' as const,
-      ticker: sym,
-      query: focusQuery.trim(),
+    try {
+      const { session_id } = await startAnalyzeSession(sym, focusQuery.trim())
+      setAnalyzeSessionId(session_id)
+      setAnalyzeSessionActive(true)
+      setSessionError(null)
+    } catch (e) {
+      setAnalyzeSessionActive(false)
+      setAnalyzeSessionId(null)
+      setSessionError(
+        e instanceof Error ? e.message : 'Failed to start analysis. Is the backend running?',
+      )
+      setPhase('failed')
     }
+  }, [focusQuery, ticker])
 
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(payload))
-      return
-    }
-
-    ws.addEventListener(
-      'open',
-      () => {
-        ws.send(JSON.stringify(payload))
-      },
-      { once: true },
-    )
-  }, [ensureAnalyzeSocket, focusQuery, ticker])
-
-  const sendFeedback = useCallback(() => {
-    const ws = wsRef.current
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      setSessionError('Not connected. Start analysis again.')
+  const sendFeedback = useCallback(async () => {
+    if (!analyzeSessionId) {
+      setSessionError('No active session. Start analysis again.')
       return
     }
     const message = feedback.trim() || 'Looks good, proceed with the draft as-is.'
-    ws.send(JSON.stringify({ action: 'feedback', message }))
-    setPhase('running')
-    setDraft(null)
-    appendLog('Feedback sent. Agents are revising the report…')
-  }, [appendLog, feedback])
+    try {
+      await postAnalyzeFeedback(analyzeSessionId, message)
+      setPhase('running')
+      setDraft(null)
+      appendLog('Feedback sent. Agents are revising the report…')
+    } catch (e) {
+      setSessionError(e instanceof Error ? e.message : 'Failed to send feedback.')
+    }
+  }, [analyzeSessionId, appendLog, feedback])
 
-  const sendChat = useCallback(() => {
+  const sendChat = useCallback(async () => {
     const q = chatQuestion.trim()
     if (!q || chatAwaitingReply) return
-    const ws = wsRef.current
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      setSessionError('Not connected. Run a new analysis to chat.')
+    if (!analyzeSessionId) {
+      setSessionError('No active session. Run a new analysis to chat.')
       return
     }
 
@@ -655,12 +656,24 @@ function App() {
         ? { ticker: ticker.trim().toUpperCase(), raw_report: reportRaw }
         : { ticker: ticker.trim().toUpperCase() }
 
-    ws.send(JSON.stringify({ action: 'chat', question: q, context }))
-    setChatAwaitingReply(true)
-    setChatMessages((prev) => [...prev, { id: crypto.randomUUID(), role: 'user', text: q }])
-    setChatQuestion('')
-    appendLog(`Chat: ${q}`)
-  }, [appendLog, chatAwaitingReply, chatQuestion, report, reportRaw, ticker])
+    try {
+      await postAnalyzeChat(analyzeSessionId, q, context)
+      setChatAwaitingReply(true)
+      setChatMessages((prev) => [...prev, { id: crypto.randomUUID(), role: 'user', text: q }])
+      setChatQuestion('')
+      appendLog(`Chat: ${q}`)
+    } catch (e) {
+      setSessionError(e instanceof Error ? e.message : 'Failed to send chat.')
+    }
+  }, [
+    analyzeSessionId,
+    appendLog,
+    chatAwaitingReply,
+    chatQuestion,
+    report,
+    reportRaw,
+    ticker,
+  ])
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
@@ -1050,21 +1063,21 @@ function App() {
                   </span>
                 </div>
                 <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-600 dark:text-zinc-400">
-                  {wsConnected ? (
+                  {analyzeSessionActive ? (
                     <span className="inline-flex items-center gap-1.5 font-medium text-emerald-700 dark:text-emerald-400">
                       <span className="relative flex size-2">
                         <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-400 opacity-40" />
                         <span className="relative size-2 rounded-full bg-emerald-500" />
                       </span>
-                      Live channel
+                      Session active (polling)
                     </span>
                   ) : phase === 'running' || phase === 'awaiting_feedback' ? (
                     <span className="inline-flex items-center gap-1.5 text-amber-700 dark:text-amber-300">
                       <SearchSpinner className="size-3 border-amber-600 border-t-transparent dark:border-amber-400" />
-                      Connecting…
+                      Starting session…
                     </span>
                   ) : (
-                    <span className="text-zinc-500">Channel idle</span>
+                    <span className="text-zinc-500">No analyze session</span>
                   )}
                   {(phase === 'running' || phase === 'awaiting_feedback') && (
                     <span className="tabular-nums text-violet-700 dark:text-violet-300">
@@ -1607,15 +1620,15 @@ function App() {
                     for a new line.
                   </p>
                 </div>
-                {wsConnected ? (
+                {analyzeSessionActive ? (
                   <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/15 px-2.5 py-1 text-[11px] font-semibold text-emerald-800 dark:text-emerald-300">
                     <span className="size-1.5 rounded-full bg-emerald-500" />
-                    Connected
+                    Session active
                   </span>
                 ) : (
                   <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-500/15 px-2.5 py-1 text-[11px] font-semibold text-amber-900 dark:text-amber-200">
                     <span className="size-1.5 rounded-full bg-amber-500" />
-                    Reconnect to send
+                    Run analysis to enable chat
                   </span>
                 )}
               </div>
@@ -1704,7 +1717,7 @@ function App() {
                 <button
                   type="button"
                   onClick={sendChat}
-                  disabled={!chatQuestion.trim() || chatAwaitingReply || !wsConnected}
+                  disabled={!chatQuestion.trim() || chatAwaitingReply || !analyzeSessionActive}
                   className="inline-flex shrink-0 items-center justify-center gap-2 rounded-2xl bg-zinc-900 px-6 py-3 text-sm font-semibold text-white shadow-md shadow-zinc-900/15 transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-45 dark:bg-violet-600 dark:shadow-violet-900/25 dark:hover:bg-violet-500"
                 >
                   {chatAwaitingReply ? (
